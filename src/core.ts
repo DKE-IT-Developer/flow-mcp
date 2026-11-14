@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 import { assemble, voiceTrack } from "./assemble.js";
 import { GEMINI_VOICES, geminiKey, saveGeminiKey, speakWithGemini } from "./gemini.js";
@@ -10,6 +10,7 @@ import { burnCaptions, captionedName, captionSetup, previewCaptions, transcribe 
 import { presenter } from "./presenter.js";
 import { characterLook, createCharacter, createProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
 import { JobQueue, type Job } from "./queue.js";
+import { earlierImages, imageKey, rememberImages } from "./dedup.js";
 import { BIN, COMPUTER, moveToBin } from "./platform.js";
 import { TECHNIQUES, techniqueById } from "./techniques.js";
 
@@ -66,6 +67,10 @@ const sceneSchema = z.object({
     .boolean()
     .optional()
     .describe("Use the previous scene's finished image as an extra reference, so this scene inherits its exact drawing of the characters, style and palette. Best way to keep a set of stills on-model."),
+  regenerate: z
+    .boolean()
+    .optional()
+    .describe("Images: make a NEW take even when this project already has an image from the exact same prompt, model, ratio and references. Without it such a request returns the earlier image and nothing is sent to Flow (no duplicate tiles)."),
   chain_previous: z
     .boolean()
     .optional()
@@ -503,7 +508,9 @@ export class LocalCore implements Core {
     if (job.params.continue_from) return runContinue(job);
     if (job.params.agent_scenes) return runAgentBatch(job);
     if (job.params.edit_asset) return runEdit(job);
-    return runGeneration(job);
+    const files = await runGeneration(job);
+    if (job.params.dedup_key && files.length) rememberImages(job.params.dedup_key, files);
+    return files;
   });
 
   async status({ detailed }: Args<"status">) {
@@ -527,7 +534,8 @@ export class LocalCore implements Core {
     const queued = this.queue.list().filter((j) => j.params.output_dir === output_dir).map((j) => Number(j.params.file_stem.match(/\d+/)?.[0] ?? 0));
     const offset = Math.max(0, ...onDisk, ...queued);
     const jobs: Job[] = [];
-    for (const [i, { chain_previous, reference_previous, technique, outfit, on_screen_text, ...scene }] of scenes.entries()) {
+    let reused = 0;
+    for (const [i, { chain_previous, reference_previous, technique, outfit, on_screen_text, regenerate, ...scene }] of scenes.entries()) {
       const phrase = technique ? techniqueById(technique)!.phrase : "";
       // A referenced character must come out identical, not merely similar, so the scene says so explicitly. The
       // wording stays medium-neutral: the same lock has to serve a flat cartoon character and a photoreal avatar.
@@ -553,16 +561,25 @@ export class LocalCore implements Core {
       const inherit = reference_previous
         ? " Match the previous image exactly for the subject's appearance, colour palette, lighting and rendering style; this is the same scene a moment later."
         : "";
-      jobs.push(
-        this.queue.add({
-          ...scene,
-          prompt: `${textFirst}${scene.prompt.trim().replace(/\.?$/, ".")}${phrase ? ` ${phrase}` : ""}${lock}${inherit}${textLast}`,
-          chain_from: chain_previous ? jobs[i - 1].id : undefined,
-          reference_from: reference_previous ? jobs[i - 1].id : undefined,
-          output_dir,
-          file_stem: `scene-${String(offset + i + 1).padStart(2, "0")}`,
-        }),
-      );
+      const params = {
+        ...scene,
+        prompt: `${textFirst}${scene.prompt.trim().replace(/\.?$/, ".")}${phrase ? ` ${phrase}` : ""}${lock}${inherit}${textLast}`,
+        chain_from: chain_previous ? jobs[i - 1].id : undefined,
+        reference_from: reference_previous ? jobs[i - 1].id : undefined,
+        output_dir,
+        file_stem: `scene-${String(offset + i + 1 - reused).padStart(2, "0")}`,
+      };
+      // Local patch: the same image request again returns the earlier image instead of another tile in Flow. Scenes
+      // that reference the previous scene depend on it, so they are always generated.
+      const key = scene.type === "image" && !reference_previous ? imageKey(params) : undefined;
+      const earlier = key && !regenerate ? earlierImages(key) : undefined;
+      if (earlier) {
+        reused++;
+        jobs.push(this.queue.addDone({ ...params, file_stem: basename(earlier[0]).replace(/\.[^.]+$/, "") }, earlier,
+          "already in this project (same prompt, model, ratio and references): nothing sent to Flow. Pass regenerate: true for a new take."));
+        continue;
+      }
+      jobs.push(this.queue.add({ ...params, dedup_key: key }));
     }
     return { output_dir, jobs: jobs.map(jobView) };
   }

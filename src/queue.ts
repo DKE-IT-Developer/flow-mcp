@@ -35,6 +35,8 @@ export interface SceneParams {
   download_quality?: "original" | "upscaled";
   output_dir: string;
   file_stem: string;
+  // Local patch: identity of an image request (dedup.ts), recorded with its files when the job finishes.
+  dedup_key?: string;
 }
 
 export interface Job {
@@ -59,6 +61,9 @@ export type JobRunner = (job: Job) => Promise<string[]>;
 // randomised pause between them.
 const PAUSE_MIN_MS = Number(process.env.FLOW_MCP_PAUSE_MIN_S ?? 25) * 1000;
 const PAUSE_MAX_MS = Number(process.env.FLOW_MCP_PAUSE_MAX_S ?? 70) * 1000;
+// Images are free and light: their own (shorter) pause. Videos keep the careful pacing above.
+const IMG_PAUSE_MIN_MS = Number(process.env.FLOW_MCP_IMAGE_PAUSE_MIN_S ?? process.env.FLOW_MCP_PAUSE_MIN_S ?? 25) * 1000;
+const IMG_PAUSE_MAX_MS = Number(process.env.FLOW_MCP_IMAGE_PAUSE_MAX_S ?? process.env.FLOW_MCP_PAUSE_MAX_S ?? 70) * 1000;
 
 export class JobQueue {
   private jobs = new Map<string, Job>();
@@ -79,6 +84,14 @@ export class JobQueue {
     };
     this.jobs.set(job.id, job);
     void this.work();
+    return job;
+  }
+
+  // A request the project already has: listed as done with the earlier files, nothing sent to Flow (local patch).
+  addDone(params: SceneParams, files: string[], note: string): Job {
+    const now = new Date().toISOString();
+    const job: Job = { id: randomUUID().slice(0, 8), status: "done", params, files, attempts: 0, credits: 0, note, createdAt: now, finishedAt: now };
+    this.jobs.set(job.id, job);
     return job;
   }
 
@@ -123,7 +136,9 @@ export class JobQueue {
         const job = this.list().find((j) => j.status === "queued");
         if (!job) return;
         if (this.lastFinished) {
-          const pause = PAUSE_MIN_MS + Math.random() * (PAUSE_MAX_MS - PAUSE_MIN_MS);
+          const img = job.params.type === "image";
+          const [lo, hi] = img ? [IMG_PAUSE_MIN_MS, IMG_PAUSE_MAX_MS] : [PAUSE_MIN_MS, PAUSE_MAX_MS];
+          const pause = lo + Math.random() * (hi - lo);
           const remaining = this.lastFinished + pause - Date.now();
           if (remaining > 0) {
             this.pausedReason = `pacing: next generation in ${Math.ceil(remaining / 1000)}s`;

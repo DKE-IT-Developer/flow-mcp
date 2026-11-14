@@ -1,10 +1,11 @@
-import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, extname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import type { Locator, Page } from "playwright-core";
 import { HOME_DIR, getFlowPage, inEnglish } from "./chrome.js";
 import type { Job } from "./queue.js";
 import { extractZip } from "./platform.js";
+import { forgetUpload, knownAssetNames, rememberUpload } from "./dedup.js";
 
 export interface FlowState {
   url: string;
@@ -444,14 +445,38 @@ async function uploadAsset(page: Page, job: Job, file: string, label: string): P
   await page.getByRole("menuitem", { name: "Upload", exact: true }).click();
   await (await chooser).setFiles(staged);
   await waitForUpload(page, name, 90_000);
+  rmSync(dirname(staged), { recursive: true, force: true });
+  rememberUpload(job.params.output_dir, file, name);
+  return name;
+}
+
+// Attaches a file, reusing the copy already in this Flow project when there is one (dedup.ts) and uploading only
+// when there is none. A remembered asset that is gone (trashed in Flow) is forgotten and uploaded fresh.
+async function attachFile(page: Page, opener: Locator, job: Job, file: string, label: string): Promise<string> {
+  if (!file.startsWith(ASSET_PREFIX) && existsSync(file)) {
+    for (const name of knownAssetNames(job.params.output_dir, file)) {
+      try {
+        await attachAsset(page, opener, name);
+        job.note = [job.note, `${label}: reused ${name} (no new upload)`].filter(Boolean).join(" · ");
+        return name;
+      } catch {
+        await page.keyboard.press("Escape");
+        await pause(page, 800);
+      }
+    }
+    forgetUpload(job.params.output_dir, file);
+  }
+  const name = await uploadAsset(page, job, file, label);
+  await attachAsset(page, opener, name);
   return name;
 }
 
 const escapeRe = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Options read "<name>", "<name> Image|Video|Avatar" or "<voice> <description>", so match on the leading name.
+// Options read "<name>", "<name> Image|Video|Avatar" or "<voice> <description>", so match on the leading name - but
+// never a longer one: "x-scene-04" must not pick "x-scene-049" or "x-scene-04-v1" (local patch 14 Nov 2026).
 const optionByName = (list: Locator, name: string) =>
-  list.getByRole("option", { name: new RegExp(`^${escapeRe(name)}`, "i") }).first();
+  list.getByRole("option", { name: new RegExp(`^${escapeRe(name)}(?![-\\d])`, "i") }).first();
 
 // The frame pickers attach on click; the ingredients picker only previews and needs "Add to prompt".
 // Option names are "<asset name>" or "<asset name> Image|Video", so match on the prefix.
@@ -480,6 +505,14 @@ export async function attachAsset(page: Page, opener: Locator, assetName: string
   }
   await list.waitFor({ state: "visible", timeout: 10_000 });
   let option = optionByName(list, assetName);
+  // The list renders only ~15 rows at a time; the picker's own "Search assets" box finds any asset by name
+  // (13 Nov 2026: an hour-old still in the Start-frame picker was otherwise never found).
+  const search = page.locator('input[aria-label="Search assets"]').first();
+  if (!(await option.isVisible().catch(() => false)) && (await search.isVisible().catch(() => false))) {
+    await search.fill(assetName);
+    await pause(page, 1500);
+    option = optionByName(list, assetName);
+  }
   // Voices, characters and avatars live behind their own tabs, so look there when "All" does not have it.
   if (!(await option.isVisible().catch(() => false))) {
     for (const tab of ["Voices", "Characters", "Avatars", "Uploads"]) {
@@ -491,6 +524,23 @@ export async function attachAsset(page: Page, opener: Locator, assetName: string
       if (await option.isVisible().catch(() => false)) break;
     }
   }
+  // The asset list is virtualised: only the rows in view exist, so an older asset is "missing" until the list is
+  // scrolled to it (13 Nov 2026: stills from an hour earlier timed out although they were in Images/All). Go back to
+  // All and wheel through the list until the option renders.
+  if (!(await option.isVisible().catch(() => false))) {
+    if (await all.isVisible().catch(() => false)) {
+      await all.click();
+      await pause(page, 1000);
+    }
+    await list.hover().catch(() => {});
+    for (let i = 0; i < 60; i++) {
+      option = optionByName(list, assetName);
+      if (await option.isVisible().catch(() => false)) break;
+      await page.mouse.wheel(0, 500);
+      await pause(page, 350);
+    }
+  }
+  await option.scrollIntoViewIfNeeded().catch(() => {});
   await option.waitFor({ state: "visible", timeout: 10_000 });
   await option.click();
   const add = page.getByRole("button", { name: "Add to prompt", exact: true });
@@ -823,10 +873,10 @@ export async function runGeneration(job: Job): Promise<string[]> {
   }
 
   if (s.first_frame) {
-    await attachAsset(page, page.getByRole("button", { name: "Start", exact: true }), await uploadAsset(page, job, s.first_frame, "start"));
+    await attachFile(page, page.getByRole("button", { name: "Start", exact: true }), job, s.first_frame, "start");
   }
   if (s.last_frame) {
-    await attachAsset(page, page.getByRole("button", { name: "End", exact: true }), await uploadAsset(page, job, s.last_frame, "end"));
+    await attachFile(page, page.getByRole("button", { name: "End", exact: true }), job, s.last_frame, "end");
   }
   // Flow's composer offers Frames OR Ingredients, never both: a clip with first/last frames cannot also carry
   // reference images. The frames already pin the look, so the references are dropped and the job says so.
@@ -838,8 +888,7 @@ export async function runGeneration(job: Job): Promise<string[]> {
     s.reference_images = [];
   }
   for (const [i, ref] of (s.reference_images ?? []).entries()) {
-    const name = await uploadAsset(page, job, ref, `ref${i + 1}`);
-    await attachAsset(page, page.getByRole("button", { name: "Add ingredients to the prompt box" }), name);
+    await attachFile(page, page.getByRole("button", { name: "Add ingredients to the prompt box" }), job, ref, `ref${i + 1}`);
   }
   const wanted = (s.reference_images ?? []).length;
   if (wanted) {
