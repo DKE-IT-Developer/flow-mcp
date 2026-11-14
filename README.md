@@ -1,5 +1,7 @@
 # flow-mcp
 
+> **Fork DKE** — perbaikan anti-dobel, cara pasang & aturan pakai tim: lihat [DKE.md](DKE.md).
+
 Drive **Google Flow** (flow.google.com) from Claude, Codex or any other MCP app, or from a local control
 panel, using Flow's own credits (free with any Google account: 50 a day), not the pay-per-use video API.
 
