@@ -6,6 +6,7 @@ import { HOME_DIR, getFlowPage, inEnglish } from "./chrome.js";
 import type { Job } from "./queue.js";
 import { extractZip } from "./platform.js";
 import { forgetUpload, knownAssetNames, rememberUpload } from "./dedup.js";
+import { motionCheck } from "./motion.js";
 
 export interface FlowState {
   url: string;
@@ -363,12 +364,16 @@ export function newestNanoBanana(names: string[]): number {
 async function pickModel(page: Page, model: string): Promise<void> {
   const button = page.getByRole("button", { name: "Select model family" });
   const latest = model === LATEST_IMAGE_MODEL;
-  if (!latest && (await button.innerText()).toLowerCase().includes(model.toLowerCase())) return;
+  if (!latest && !model.includes("|") && (await button.innerText()).replace(/\s+/g, " ").replace(/ ?arrow_drop_down/, "").trim().toLowerCase() === model.toLowerCase()) return;
   await button.click();
   const items = page.getByRole("menuitem");
   await items.first().waitFor({ state: "visible", timeout: 5000 });
   const names = (await items.allInnerTexts()).map((t) => t.replace(/\s+/g, " ").trim());
-  const index = latest ? newestNanoBanana(names) : names.findIndex((n) => n.toLowerCase().includes(model.toLowerCase()));
+  // "A|B": the first model in the list that Flow still offers (DKE fork: tiers outlive models that leave Flow).
+  const wanted = model.split("|").map((m) => m.trim().toLowerCase());
+  const exact = (m: string) => names.findIndex((n) => n.toLowerCase() === m || n.toLowerCase().startsWith(m + " leaving"));
+  const loose = (m: string) => names.findIndex((n) => n.toLowerCase().includes(m));
+  const index = latest ? newestNanoBanana(names) : [...wanted.map(exact), ...wanted.map(loose)].find((i) => i >= 0) ?? -1;
   const shown = (await button.innerText()).replace(/\s+/g, " ");
   if (index < 0 || (latest && shown.includes(names[index]))) {
     // Nothing to change (already the newest, or no numbered Nano Banana here at all): close the menu, pick nothing.
@@ -925,6 +930,11 @@ export async function runGeneration(job: Job): Promise<string[]> {
     const handle = renamed && id.startsWith("title:") ? `title:${newTitle}` : id;
     files.push(...(await downloadMedia(page, handle, stem, s.download_quality)));
     await pause(page, 1500);
+  }
+  // DKE fork: every clip gets a motion check, so a jump or morph is reported before anyone builds on it.
+  for (const f of files.filter((x) => /\.(mp4|webm|mov)$/i.test(x))) {
+    const line = await motionCheck(f).catch((e) => `motion check skipped: ${e instanceof Error ? e.message.split("\n")[0] : e}`);
+    job.note = [job.note, line].filter(Boolean).join(" · ");
   }
   return files;
 }

@@ -67,6 +67,14 @@ const sceneSchema = z.object({
     .boolean()
     .optional()
     .describe("Use the previous scene's finished image as an extra reference, so this scene inherits its exact drawing of the characters, style and palette. Best way to keep a set of stills on-model."),
+  tier: z
+    .enum(["draft", "final", "hero"])
+    .optional()
+    .describe("Video model by purpose, when `model` is not given. draft = free (Veo 3.1 Lite [Lower Priority], 0 credits): checks framing, camera and motion; if its acting is right, USE the draft clip, it is full quality. final = Omni 1.2 Flash (~24), which follows written acting beats most closely. hero = two Omni takes to pick from (~48, raise max_credits) for close-ups where face, expression or hands carry the shot. The most expensive model (Veo 3.1 - Quality, 100) acted no more naturally than the free one in a side-by-side test."),
+  performance: z
+    .boolean()
+    .optional()
+    .describe("Video with people gets a PERFORMANCE block (real-time speed, weight, eyes-first expressions, blinks, breathing, still hands, real skin) appended automatically. false = leave it out."),
   regenerate: z
     .boolean()
     .optional()
@@ -481,6 +489,23 @@ export const VOICES = [
   { name: "Iapetus", description: "male, clear, mid-low pitch" },
 ];
 
+// DKE fork, 14 Nov 2026. Video model per purpose; "A|B" = first one Flow still offers. Quotes read from Flow that day
+// at 720p, 8 s, 9:16, x1: Veo Lite LP 0, Veo Lite 5, Veo Fast 10, Omni 1.2 Flash 24, Veo Quality 100.
+// A/B on one acting shot (same START/END and prompt): the three Veo models acted almost identically (improvised a
+// hand-over-mouth giggle, intensity 4), so price bought no naturalness; Omni 1.2 Flash followed the written beats
+// (eyes, then fingertips, then a smile from the eyes, intensity 3). Hence hero = two Omni takes to choose from, not Veo
+// Quality. A Veo draft does NOT preview Omni's acting: if the draft is right, keep the draft clip itself.
+const TIERS = {
+  draft: "Veo 3.1 - Lite [Lower Priority]|Veo 3.1 - Lite",
+  final: "Omni 1.2 Flash",
+  hero: "Omni 1.2 Flash",
+} as const;
+
+// Scenes with people get the acting rules that made shots read as filmed rather than generated (sinema-natural 04).
+const PEOPLE = /\b(she|he|her|his|they|woman|women|man|men|girl|boy|person|people|talent|face|hands?|fingers?|smiles?|eyes)\b/i;
+const PERFORMANCE =
+  "PERFORMANCE — real people filmed in real time, not animation: real-time speed, no slow motion. Every movement has weight: a small anticipation, the action, then easing out; body weight shifts and fabric follows a moment later. The eyes lead: the gaze moves first, the head follows, the face reacts last. Expressions are motivated by what is visible in the scene, intensity 2-3 of 5, growing and settling gradually, never snapping on or freezing at the peak. Natural blinks every few seconds, quiet breathing visible in the shoulders, slight asymmetry. Hands move little and stay relaxed: a touch, then rest, five fingers with naturally bending joints. Skin keeps real texture with pores and fine hair. Faces, bodies and objects keep their exact shape in every frame.";
+
 const BUSY = "A generation is running in the Flow tab. Wait for it to finish (flow_wait), then retry.";
 
 export class LocalCore implements Core {
@@ -535,7 +560,13 @@ export class LocalCore implements Core {
     const offset = Math.max(0, ...onDisk, ...queued);
     const jobs: Job[] = [];
     let reused = 0;
-    for (const [i, { chain_previous, reference_previous, technique, outfit, on_screen_text, regenerate, ...scene }] of scenes.entries()) {
+    for (const [i, { chain_previous, reference_previous, technique, outfit, on_screen_text, regenerate, tier, performance, ...scene }] of scenes.entries()) {
+      if (scene.type === "video" && tier && !scene.model) {
+        scene.model = TIERS[tier];
+        if (tier === "hero") scene.variants ??= 2; // two takes; quote ~48, so max_credits must be raised on purpose
+        if (!scene.model.startsWith("Omni")) delete scene.resolution, delete scene.duration; // Veo: fixed 8 s, no resolution radio
+      }
+      const acting = scene.type === "video" && performance !== false && PEOPLE.test(scene.prompt) ? ` ${PERFORMANCE}` : "";
       const phrase = technique ? techniqueById(technique)!.phrase : "";
       // A referenced character must come out identical, not merely similar, so the scene says so explicitly. The
       // wording stays medium-neutral: the same lock has to serve a flat cartoon character and a photoreal avatar.
@@ -563,7 +594,7 @@ export class LocalCore implements Core {
         : "";
       const params = {
         ...scene,
-        prompt: `${textFirst}${scene.prompt.trim().replace(/\.?$/, ".")}${phrase ? ` ${phrase}` : ""}${lock}${inherit}${textLast}`,
+        prompt: `${textFirst}${scene.prompt.trim().replace(/\.?$/, ".")}${phrase ? ` ${phrase}` : ""}${lock}${inherit}${acting}${textLast}`,
         chain_from: chain_previous ? jobs[i - 1].id : undefined,
         reference_from: reference_previous ? jobs[i - 1].id : undefined,
         output_dir,
