@@ -122,6 +122,12 @@ export function lint(p: Production, exists: (path: string) => boolean, projectDi
     if (!consentOk) err("E_CONSENT", `pemeran '${name}' real_person tanpa berkas consent yang ada`);
     for (const ph of c.photos ?? []) if (!ph.startsWith("privat:")) err("E_PHOTOS_PUBLIC", `pemeran '${name}': foto asli '${ph}' harus berawalan privat:`);
   }
+  // 21 Nov 2026 (Kopi Sudut): wardrobe "knit polo" tanpa panjang lengan → shot tangan/POV keluar lengan panjang padahal talent
+  // berlengan pendek. Setiap wardrobe atasan wajib menyebut panjang lengan.
+  const SLEEVE = /sleeve|sleeveless|tank top|strapless|lengan/i, TOP = /shirt|polo|tee|t-shirt|blouse|kemeja|kaos|jacket|hoodie|sweater|dress|gamis|top\b/i;
+  for (const [name, c] of Object.entries(p.cast))
+    for (const [world, w] of Object.entries(c.wardrobe ?? {}))
+      if (TOP.test(w) && !SLEEVE.test(w)) err("E_WARDROBE_SLEEVE", `pemeran '${name}' wardrobe '${world}' tanpa panjang lengan (mis. "short-sleeved … forearms bare")`);
   for (const [name, w] of Object.entries(p.worlds)) if (!hasRef(w.ambience)) warn("W_NO_AMBIENCE", `dunia '${name}' tanpa ambience`);
 
   let prev: Production["shots"][number] | undefined;
@@ -664,6 +670,7 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   assert(has(base, "W_QUESTION", "S01"), "W_QUESTION");
   assert(has(codes(mk((d) => delete d.worlds.kafe.ambience)), "W_NO_AMBIENCE"), "W_NO_AMBIENCE");
   assert(has(codes(mk((d) => delete d.cast.raka.voice)), "W_NO_VOICE", "S01"), "W_NO_VOICE");
+  assert(codes(mk((d) => { d.cast.raka.wardrobe.kafe = "rust-orange knit polo shirt, dark denim apron"; })).some((i) => i.code === "E_WARDROBE_SLEEVE"), "E_WARDROBE_SLEEVE");
   assert(has(codes(mk((d) => { d.shots[0].angle = "dutch-angle"; d.shots[0].move = "dolly-in"; })), "W_DUTCH_MOVE", "S01"), "W_DUTCH_MOVE");
   assert(has(codes(mk((d) => { d.shots[0].screen_dir = "L>R"; d.shots[1].screen_dir = "R>L"; })), "W_SCREEN_DIR", "S02"), "W_SCREEN_DIR");
   assert(has(codes(mk((d) => d.shots.forEach((s: any) => (s.angle = "eye-level")))), "W_FEW_ANGLES"), "W_FEW_ANGLES");
