@@ -43,6 +43,8 @@ export interface SceneParams {
   force?: string;
   // Production mode, tools without a Flow quote (edit, continue): the conservative credit estimate checked against the budget.
   estimate?: number;
+  // Production mode: centre (0..1) of a crop:<factor> frame reference.
+  crop_center?: [number, number];
 }
 
 export interface Job {

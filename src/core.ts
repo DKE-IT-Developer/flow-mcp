@@ -10,7 +10,7 @@ import { KOKORO_DEFAULT_VOICE, KOKORO_MB, KOKORO_VOICES, kokoroReady, speakWithK
 import { extractFirstFrame, extractFrameAt, extractLastFrame } from "./chain.js";
 import { burnCaptions, captionedName, captionSetup, previewCaptions, transcribe } from "./captions.js";
 import { presenter } from "./presenter.js";
-import { appendLog, budgetLeft, budgetMessage, checkReport, estimateCost, gate, loadProduction, MEASURED_NOTE, overBudget } from "./produksi.js";
+import { appendLog, budgetLeft, budgetMessage, checkFrameRefs, checkReport, estimateCost, gate, isDerivedRef, loadProduction, MEASURED_NOTE, overBudget, resolveSceneFrames } from "./produksi.js";
 import { characterLook, createCharacter, createProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
 import { JobQueue, type Job, type SceneParams } from "./queue.js";
 import { earlierImages, imageKey, rememberImages } from "./dedup.js";
@@ -46,7 +46,11 @@ const sceneSchema = z.object({
   last_frame: z
     .string()
     .optional()
-    .describe("Last frame: absolute image path, 'asset:<title>', or the absolute path of a finished clip (.mp4) to end exactly where that clip begins. With first_frame set to the clip before, this redoes a middle clip and keeps both cuts invisible."),
+    .describe("Last frame: absolute image path, 'asset:<title>', or the absolute path of a finished clip (.mp4) to end exactly where that clip begins. With first_frame set to the clip before, this redoes a middle clip and keeps both cuts invisible. Projects with a produksi.json also take 'crop:1.10' (the resolved first frame enlarged 1.10x, same size; see crop_center) or 'shot:S02@4.2'."),
+  crop_center: z
+    .tuple([z.number().min(0).max(1), z.number().min(0).max(1)])
+    .optional()
+    .describe("Projects with a produksi.json only: centre [x, y] (0..1, default [0.5, 0.5]) of a 'crop:' frame; the crop box stays inside the image."),
   reference_images: z
     .array(z.string())
     .max(3)
@@ -531,7 +535,7 @@ const BUSY = "A generation is running in the Flow tab. Wait for it to finish (fl
 // The params one scene of flow_generate queues, kept pure so the opt-in proof (`node dist/core.js --cek`) can compare
 // them with what generate() queued before production mode existed.
 export function buildParams(
-  { chain_previous, reference_previous, technique, angle, outfit, on_screen_text, regenerate: _regenerate, tier, performance, shot, force, ...scene }: Scene,
+  { chain_previous, reference_previous, technique, angle, outfit, on_screen_text, regenerate: _regenerate, tier, performance, shot, force, crop_center, ...scene }: Scene,
   ctx: { prevId?: string; output_dir: string; file_stem: string; production?: boolean },
 ): { params: SceneParams; key?: string } {
   if (scene.type === "video" && tier && !scene.model) {
@@ -576,6 +580,7 @@ export function buildParams(
     // Production mode only: carried to the job (credit log). Elsewhere they are dropped, so params stay as before.
     ...(ctx.production && shot ? { shot } : {}),
     ...(ctx.production && force ? { force } : {}),
+    ...(ctx.production && crop_center ? { crop_center } : {}),
   };
   // Local patch: the same image request again returns the earlier image instead of another tile in Flow. Scenes
   // that reference the previous scene depend on it, so they are always generated.
@@ -664,6 +669,12 @@ export class LocalCore implements Core {
       if (!clip) throw new Error(`chain_previous: the previous scene (${chain_from}) produced no video, so this scene was skipped.`);
       job.params.first_frame = await extractLastFrame(clip);
     }
+    // Production mode: shot:/crop: frame references become files in frame/turunan/ right before the job runs (the
+    // parent clip may have been chosen after queueing). A face below 0.80 fails the job here, before Flow is opened.
+    if (isDerivedRef(job.params.first_frame) || isDerivedRef(job.params.last_frame)) {
+      const notes = await resolveSceneFrames(job.params.output_dir, job.params);
+      job.note = [job.note, ...notes].filter(Boolean).join(" · ");
+    }
     // Production mode: tools without a Flow quote are re-checked against the budget right before they run, because
     // jobs ahead of them in the queue may have spent it since they were queued.
     if (job.params.estimate !== undefined) {
@@ -698,6 +709,11 @@ export class LocalCore implements Core {
     const output_dir = projectDir(project);
     // Production gates G1/G2 (produksi.json only; without it every scene passes untouched). Checked for every scene
     // before any job exists, so a refused scene never leaves half a batch queued.
+    // shot:/crop: frame references: production mode only, parent clip must exist (cheap checks, no ffmpeg).
+    const badRefs = scenes.flatMap((s, i) => {
+      try { checkFrameRefs(output_dir, s.chain_previous && !s.first_frame ? { ...s, first_frame: "(chain_previous)" } : s); return []; } catch (e) { return [`Scene ${i + 1}: ${(e as Error).message}`]; }
+    });
+    if (badRefs.length) throw new Error(badRefs.join("\n"));
     const gates = scenes.map((s) => gate(output_dir, s));
     const refused = gates.flatMap((g, i) => (g.ok ? [] : [`Scene ${i + 1}: ${g.reason}`]));
     if (refused.length) throw new Error(refused.join("\n"));
@@ -719,6 +735,7 @@ export class LocalCore implements Core {
       }
       const job = this.queue.add({ ...params, dedup_key: key });
       const g = gates[i];
+      if (g.ok && g.derived) job.note = "G2 ditunda: pasangan turunan (shot: + crop:) diverifikasi wajah saat job jalan";
       if (g.ok && g.force) {
         job.note = `force: ${g.force} (gerbang G1/G2 dilewati; anggaran tetap dicek)`;
         try {
@@ -1177,6 +1194,18 @@ if (process.argv[1]?.endsWith("core.js") && process.argv.includes("--cek")) {
     logDone({ id: "jm1", status: "done", params: p20, files: [], attempts: 1, credits: 1380, createdAt: "" } as Job, [join(dir, "edit-01.mp4")]);
     const ml = rd(join(dir, "produksi-log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.job === "jm1");
     assert(spentCredits(dir) - before === 20 && ml[0].measured === -500 && ml[1].measured === 1380 && ml.every((e) => e.credits === 20), "edit: anggaran = perkiraan 20, saldo di kolom measured");
+    // 4b. frame references shot:/crop: (validated at generate(), no job when refused)
+    added = [];
+    msg = "";
+    try { await gen([{ prompt: "d", tier: "final", shot: "S02", first_frame: "shot:S02@4.2", last_frame: "crop:1.10" }]); } catch (e) { msg = (e as Error).message; }
+    assert(msg.includes("S02 belum punya klip; jalankan setelah klip induk dipilih") && added.length === 0, `shot: tanpa klip induk -> ditolak (${msg})`);
+    writeFileSync(join(dir, "scene-07.mp4"), "");
+    await gen([{ prompt: "d", tier: "final", shot: "S02", first_frame: "shot:S01@4.2", last_frame: "crop:1.10", crop_center: [0.4, 0.3] }]);
+    assert(added.length === 1 && added[0].first_frame === "shot:S01@4.2" && JSON.stringify(added[0].crop_center) === "[0.4,0.3]", "pasangan turunan: G2 ditunda, rujukan + crop_center dibawa ke job");
+    added = [];
+    msg = "";
+    try { await gen([{ prompt: "d", tier: "final" }], "proyek-lain-2").then(() => gen([{ prompt: "e", first_frame: "shot:S01@1" }], "proyek-lain-2")); } catch (e) { msg = (e as Error).message; }
+    assert(msg.includes("produksi.json") && added.length === 1, `project tanpa produksi.json: shot: ditolak jelas (${msg})`);
     // 5. broken produksi.json: refused, file named, no job; another project is unaffected
     writeFileSync(join(dir, "produksi.json"), "{ rusak");
     added = [];
