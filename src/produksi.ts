@@ -1,6 +1,6 @@
 // produksi.json: schema + lint (tahap 1). Opt-in: a project without the file behaves as before.
 // Self-check: `node dist/produksi.js --cek`
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { z } from "zod";
@@ -165,6 +165,77 @@ export function lint(p: Production, exists: (path: string) => boolean, projectDi
   return out;
 }
 
+export type ClipQa = { motion?: string; face_median?: number; speech?: string; voice?: number; skipped?: string[] };
+export type Label = { kind: "voice" | "ambience"; verdict: "same" | "different" | "jump" | "ok"; file?: string; at: string };
+export type ShotQa = { keyframes?: { passed: boolean; face?: number; by: string; at: string }; clips?: Record<string, ClipQa>; labels?: Label[] };
+export type Qa = Record<string, ShotQa>;
+export type LogEntry = { t: string; job: string; shot?: string; file?: string; tier?: string; quote?: number; credits?: number; estimate?: boolean; force?: string };
+
+const QA_FILE = "qa.json";
+const LOG_FILE = "produksi-log.jsonl";
+
+/** qa.json milik flow-mcp (produksi.json tidak pernah ditulis). Rusak -> error menyebut berkas+jalur. */
+export function readQa(projectDir: string): Qa {
+  const f = join(projectDir, QA_FILE);
+  if (!existsSync(f)) return {};
+  try {
+    const d = JSON.parse(readFileSync(f, "utf8"));
+    if (!d || typeof d !== "object" || Array.isArray(d)) throw new Error("bukan objek");
+    return d as Qa;
+  } catch (e) {
+    throw new Error(`${QA_FILE} rusak (${f}): ${(e as Error).message}`);
+  }
+}
+
+/** Gabung patch ke shot: baca ulang disk, clips digabung per berkas+kolom, labels ditambah; tulis .tmp lalu rename. */
+export function mergeQa(projectDir: string, shot: string, patch: Partial<ShotQa>): void {
+  const qa = readQa(projectDir);
+  const cur: ShotQa = qa[shot] ?? {};
+  const next: ShotQa = { ...cur };
+  if (patch.keyframes) next.keyframes = patch.keyframes;
+  if (patch.clips) {
+    const clips: Record<string, ClipQa> = { ...(cur.clips ?? {}) };
+    for (const [k, v] of Object.entries(patch.clips)) clips[k] = { ...(clips[k] ?? {}), ...v };
+    next.clips = clips;
+  }
+  if (patch.labels) next.labels = [...(cur.labels ?? []), ...patch.labels];
+  qa[shot] = next;
+  const f = join(projectDir, QA_FILE);
+  const tmp = `${f}.tmp`;
+  writeFileSync(tmp, JSON.stringify(qa, null, 2) + "\n");
+  renameSync(tmp, f);
+}
+
+export function appendLog(projectDir: string, entry: LogEntry): void {
+  appendFileSync(join(projectDir, LOG_FILE), JSON.stringify(entry) + "\n");
+}
+
+function readLog(projectDir: string): LogEntry[] {
+  const f = join(projectDir, LOG_FILE);
+  if (!existsSync(f)) return [];
+  const out: LogEntry[] = [];
+  for (const line of readFileSync(f, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try { out.push(JSON.parse(line) as LogEntry); } catch { /* baris rusak dilewati */ }
+  }
+  return out;
+}
+
+/** Kredit terpakai: hanya entri ber-file (job selesai), sekali per job id (retry tak menggandakan). */
+export function spentCredits(projectDir: string): number {
+  const byJob = new Map<string, number>();
+  for (const e of readLog(projectDir)) if (e.file) byJob.set(e.job, e.credits ?? e.quote ?? 0);
+  let sum = 0;
+  for (const v of byJob.values()) sum += v;
+  return sum;
+}
+
+/** Berkas terbaru (urutan berkas log) untuk shot itu yang punya `file`. */
+export function latestClip(projectDir: string, shot: string): string | undefined {
+  const l = readLog(projectDir).filter((e) => e.shot === shot && e.file);
+  return l.length ? l[l.length - 1].file : undefined;
+}
+
 if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) {
   const assert = (c: unknown, m: string) => {
     if (!c) throw new Error(`cek gagal: ${m}`);
@@ -216,7 +287,7 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   assert(!ProductionSchema.safeParse({ ...raw, shots: [{ ...raw.shots[0], angel: "x" }] }).success, "kunci salah ketik ditolak (strict)");
   assert(!ProductionSchema.safeParse({ ...raw, titel: "x" }).success, "kunci akar salah ketik ditolak");
   assert(!ProductionSchema.safeParse({ ...raw, shots: [{ ...raw.shots[0], tier: "finel" }] }).success, "tier salah ketik ditolak");
-  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { mkdtempSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const dir = mkdtempSync(join(tmpdir(), "produksi-cek-"));
   assert(loadProduction(dir) === undefined, "tanpa berkas -> undefined");
@@ -230,5 +301,37 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   msg = "";
   try { loadProduction(dir); } catch (e) { msg = (e as Error).message; }
   assert(msg.startsWith("produksi.json: stage:"), "skema salah menyebut jalur zod");
+  // ledger qa.json + log kredit
+  const { mkdtempSync: mkd2, readdirSync } = await import("node:fs");
+  const qd = mkd2(join(tmpdir(), "produksi-qa-"));
+  assert(Object.keys(readQa(qd)).length === 0, "readQa tanpa berkas -> kosong");
+  mergeQa(qd, "S01", { keyframes: { passed: true, face: 0.9, by: "t", at: "2026-01-01" } });
+  mergeQa(qd, "S02", { clips: { "a.mp4": { motion: "ok" } } });
+  mergeQa(qd, "S02", { clips: { "b.mp4": { face_median: 0.7 } } });
+  mergeQa(qd, "S02", { clips: { "a.mp4": { speech: "ok" } }, labels: [{ kind: "voice", verdict: "same", at: "t1" }] });
+  mergeQa(qd, "S02", { labels: [{ kind: "ambience", verdict: "ok", at: "t2" }] });
+  const q = readQa(qd);
+  assert(q.S01?.keyframes?.passed === true && q.S02, "dua shot sama-sama ada");
+  assert(q.S02.clips?.["a.mp4"]?.motion === "ok" && q.S02.clips["a.mp4"].speech === "ok" && q.S02.clips["b.mp4"]?.face_median === 0.7, "clip digabung per berkas dan per kolom");
+  assert(q.S02.labels?.length === 2, "label ditambah, bukan ditimpa");
+  assert(!readdirSync(qd).some((f) => f.endsWith(".tmp")), "tak ada .tmp tersisa");
+  writeFileSync(join(qd, "qa.json"), JSON.stringify({ S09: { labels: [] } }));
+  mergeQa(qd, "S01", { keyframes: { passed: false, by: "t", at: "x" } });
+  assert(readQa(qd).S09 && readQa(qd).S01?.keyframes?.passed === false, "gabung dengan isi disk terbaru (tulisan luar tak hilang)");
+  assert(!existsSync(join(qd, "produksi.json")), "flow-mcp tak menulis produksi.json");
+  writeFileSync(join(qd, "qa.json"), "{ rusak");
+  let qmsg = "";
+  try { readQa(qd); } catch (e) { qmsg = (e as Error).message; }
+  assert(qmsg.includes("qa.json") && qmsg.includes(qd), "qa.json rusak menyebut berkas+jalur");
+  const ld = mkd2(join(tmpdir(), "produksi-log-"));
+  assert(spentCredits(ld) === 0 && latestClip(ld, "S01") === undefined, "log kosong");
+  appendLog(ld, { t: "1", job: "a", shot: "S01", file: "a1.mp4", credits: 24 });
+  appendLog(ld, { t: "2", job: "a", shot: "S01", file: "a1.mp4", credits: 24 });
+  appendLog(ld, { t: "3", job: "b", shot: "S01", file: "b1.mp4", quote: 10 });
+  appendLog(ld, { t: "4", job: "c", shot: "S01", credits: 99 });
+  appendLog(ld, { t: "5", job: "d", shot: "S02", file: "d1.mp4", credits: 5 });
+  assert(spentCredits(ld) === 24 + 10 + 5, "kredit unik per job; gagal (tanpa file) tak dihitung");
+  assert(latestClip(ld, "S01") === "b1.mp4", "latestClip melewati entri tanpa file");
+  assert(latestClip(ld, "S03") === undefined, "latestClip shot tanpa klip");
   console.log("produksi ok");
 }
