@@ -1,6 +1,6 @@
 // produksi.json: schema + lint (tahap 1). Opt-in: a project without the file behaves as before.
 // Self-check: `node dist/produksi.js --cek`
-import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { z } from "zod";
@@ -92,7 +92,7 @@ export function loadProduction(projectDir: string): Production | undefined {
 
 // Same default as OUTPUT_ROOT in core.ts, recomputed here so this module stays free of the heavy core imports.
 const outputRoot = () => process.env.FLOW_MCP_OUTPUT ?? join(homedir(), "flow-mcp-out");
-const privateRoot = () => process.env.SINEMA_PRIVATE_ROOT ?? dirname(resolve(outputRoot()));
+const privateRoot = () => resolve(process.env.SINEMA_PRIVATE_ROOT ?? dirname(resolve(outputRoot())));
 
 export function resolvePrivate(projectDir: string, ref: string): string {
   if (ref.startsWith("privat:")) {
@@ -172,6 +172,7 @@ export type Qa = Record<string, ShotQa>;
 export type LogEntry = { t: string; job: string; shot?: string; file?: string; tier?: string; quote?: number; credits?: number; estimate?: boolean; force?: string };
 
 const QA_FILE = "qa.json";
+let tmpSeq = 0;
 const LOG_FILE = "produksi-log.jsonl";
 
 /** qa.json milik flow-mcp (produksi.json tidak pernah ditulis). Rusak -> error menyebut berkas+jalur. */
@@ -201,7 +202,7 @@ export function mergeQa(projectDir: string, shot: string, patch: Partial<ShotQa>
   if (patch.labels) next.labels = [...(cur.labels ?? []), ...patch.labels];
   qa[shot] = next;
   const f = join(projectDir, QA_FILE);
-  const tmp = `${f}.tmp`;
+  const tmp = `${f}.${process.pid}.${++tmpSeq}.tmp`;
   writeFileSync(tmp, JSON.stringify(qa, null, 2) + "\n");
   renameSync(tmp, f);
 }
@@ -224,7 +225,13 @@ function readLog(projectDir: string): LogEntry[] {
 /** Kredit terpakai: hanya entri ber-file (job selesai), sekali per job id (retry tak menggandakan). */
 export function spentCredits(projectDir: string): number {
   const byJob = new Map<string, number>();
-  for (const e of readLog(projectDir)) if (e.file) byJob.set(e.job, e.credits ?? e.quote ?? 0);
+  for (const e of readLog(projectDir)) {
+    if (!e.file) continue;
+    const v = e.credits ?? e.quote;
+    // Entri belakangan tanpa harga (mis. berkas varian kedua) tidak menghapus harga yang sudah tercatat.
+    if (v !== undefined) byJob.set(e.job, v);
+    else if (!byJob.has(e.job)) byJob.set(e.job, 0);
+  }
   let sum = 0;
   for (const v of byJob.values()) sum += v;
   return sum;
@@ -336,6 +343,14 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   try { resolvePrivate("/tmp/x", "privat:../../x"); } catch { thrown = true; }
   assert(thrown, "resolvePrivate menolak ../");
   assert(resolvePrivate("/tmp/x", "privat:a/b.jpg").endsWith("talent-privat/x/a/b.jpg"), "resolvePrivate normal");
+  {
+    const saved = process.env.SINEMA_PRIVATE_ROOT;
+    process.env.SINEMA_PRIVATE_ROOT = "relatif-root";
+    let r = "";
+    try { r = resolvePrivate("/tmp/x", "privat:a.jpg"); } catch (e) { r = `THROW ${(e as Error).message}`; }
+    if (saved === undefined) delete process.env.SINEMA_PRIVATE_ROOT; else process.env.SINEMA_PRIVATE_ROOT = saved;
+    assert(r === resolve("relatif-root", "talent-privat", "x", "a.jpg"), `SINEMA_PRIVATE_ROOT relatif berfungsi (${r})`);
+  }
   assert(has(codes(mk((d) => (d.shots[1].id = "S01"))), "E_ID", "S01"), "id shot ganda");
   assert(!ProductionSchema.safeParse({ ...raw, shots: [{ ...raw.shots[0], angel: "x" }] }).success, "kunci salah ketik ditolak (strict)");
   assert(!ProductionSchema.safeParse({ ...raw, titel: "x" }).success, "kunci akar salah ketik ditolak");
@@ -368,6 +383,10 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   assert(q.S02.clips?.["a.mp4"]?.motion === "ok" && q.S02.clips["a.mp4"].speech === "ok" && q.S02.clips["b.mp4"]?.face_median === 0.7, "clip digabung per berkas dan per kolom");
   assert(q.S02.labels?.length === 2, "label ditambah, bukan ditimpa");
   assert(!readdirSync(qd).some((f) => f.endsWith(".tmp")), "tak ada .tmp tersisa");
+  writeFileSync(join(qd, "qa.json.tmp"), "milik penulis lain");
+  mergeQa(qd, "S03", { keyframes: { passed: true, by: "t", at: "y" } });
+  assert(readFileSync(join(qd, "qa.json.tmp"), "utf8") === "milik penulis lain", "tmp unik per proses (tak menimpa .tmp penulis lain)");
+  rmSync(join(qd, "qa.json.tmp"));
   writeFileSync(join(qd, "qa.json"), JSON.stringify({ S09: { labels: [] } }));
   mergeQa(qd, "S01", { keyframes: { passed: false, by: "t", at: "x" } });
   assert(readQa(qd).S09 && readQa(qd).S01?.keyframes?.passed === false, "gabung dengan isi disk terbaru (tulisan luar tak hilang)");
@@ -386,6 +405,10 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   assert(spentCredits(ld) === 24 + 10 + 5, "kredit unik per job; gagal (tanpa file) tak dihitung");
   assert(latestClip(ld, "S01") === "b1.mp4", "latestClip melewati entri tanpa file");
   assert(latestClip(ld, "S03") === undefined, "latestClip shot tanpa klip");
+  appendLog(ld, { t: "6", job: "a", shot: "S01", file: "a1.mp4" });
+  assert(spentCredits(ld) === 24 + 10 + 5, "entri belakangan tanpa credits/quote tak menghapus harga sebelumnya");
+  appendLog(ld, { t: "7", job: "e", shot: "S03", file: "e1.mp4" });
+  assert(spentCredits(ld) === 24 + 10 + 5, "job tanpa harga sama sekali = 0");
   // checkReport (flow_production check)
   const cd = mkd2(join(tmpdir(), "produksi-rep-"));
   assert((checkReport(cd, "json") as any).pipeline === false, "tanpa produksi.json -> pipeline:false");
