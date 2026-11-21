@@ -7,6 +7,8 @@ import type { Job } from "./queue.js";
 import { extractZip } from "./platform.js";
 import { forgetUpload, knownAssetNames, rememberUpload } from "./dedup.js";
 import { motionCheck } from "./motion.js";
+import { postChecks } from "./periksa.js";
+import { loadProduction } from "./produksi.js";
 import { g3Check } from "./produksi.js";
 
 export interface FlowState {
@@ -940,6 +942,15 @@ export async function runGeneration(job: Job): Promise<string[]> {
   for (const f of files.filter((x) => /\.(mp4|webm|mov)$/i.test(x))) {
     const line = await motionCheck(f).catch((e) => `motion check skipped: ${e instanceof Error ? e.message.split("\n")[0] : e}`);
     job.note = [job.note, line].filter(Boolean).join(" · ");
+    // Tahap 1 (mode produksi): wajah/ucapan/suara. Hanya job ber-`shot`; tidak pernah menggagalkan job.
+    if (s.shot) {
+      try {
+        const shot = loadProduction(s.output_dir)?.shots.find((x) => x.id === s.shot);
+        if (shot) job.note = [job.note, ...(await postChecks(f, s.output_dir, shot))].filter(Boolean).join(" · ");
+      } catch (e) {
+        job.note = [job.note, `dilewati: cek pasca-unduh (${e instanceof Error ? e.message.split("\n")[0] : e})`].filter(Boolean).join(" · ");
+      }
+    }
   }
   return files;
 }
