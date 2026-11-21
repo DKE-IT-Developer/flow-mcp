@@ -7,7 +7,7 @@ import type { Job } from "./queue.js";
 import { extractZip } from "./platform.js";
 import { forgetUpload, knownAssetNames, rememberUpload } from "./dedup.js";
 import { motionCheck } from "./motion.js";
-import { postChecks } from "./periksa.js";
+import { checkBudget, postChecks } from "./periksa.js";
 import { g3Check, loadProduction } from "./produksi.js";
 
 export interface FlowState {
@@ -859,6 +859,13 @@ async function ensureProjectGrid(page: Page): Promise<void> {
   await scrollToTop(page);
 }
 
+// Jobs whose paid action was submitted to Flow (Start generation clicked): if they fail after this, the credits are
+// spent anyway, so the worker logs them as `charged` for the production budget (core.ts logCharged).
+const submitted = new WeakSet<Job>();
+export const markCharged = (job: Job) => void submitted.add(job);
+/** True once per submission: reading it clears the mark. */
+export const takeCharged = (job: Job) => submitted.delete(job);
+
 // Drives one generation in the Flow tab and returns the downloaded file paths.
 export async function runGeneration(job: Job): Promise<string[]> {
   const state = await getFlowState();
@@ -913,6 +920,7 @@ export async function runGeneration(job: Job): Promise<string[]> {
   await scrollToTop(page);
   const before = await mediaIds(page);
   await start.click();
+  markCharged(job);
 
   const variants = s.variants ?? 1;
   const fresh = await waitForNewMedia(page, before, variants, s.type === "image" ? IMAGE_TIMEOUT_MS : VIDEO_TIMEOUT_MS, job, s.type === "image" ? "image" : "video");
@@ -945,7 +953,7 @@ export async function runGeneration(job: Job): Promise<string[]> {
     if (s.shot) {
       try {
         const shot = loadProduction(s.output_dir)?.shots.find((x) => x.id === s.shot);
-        if (shot) job.note = [job.note, ...(await postChecks(f, s.output_dir, shot))].filter(Boolean).join(" · ");
+        if (shot) job.note = [job.note, ...(await postChecks(f, s.output_dir, shot, checkBudget(job.id)))].filter(Boolean).join(" · ");
       } catch (e) {
         job.note = [job.note, `dilewati: cek pasca-unduh (${e instanceof Error ? e.message.split("\n")[0] : e})`].filter(Boolean).join(" · ");
       }
@@ -1392,6 +1400,7 @@ export async function runEdit(job: Job): Promise<string[]> {
   const start = page.getByRole("button", { name: "Start generation" });
   if (!(await start.isEnabled())) throw new Error("Flow did not accept the edit prompt (Start generation stayed disabled).");
   await start.click();
+  markCharged(job);
 
   // Progress shows as "NN% <prompt>" inside the edit view and disappears when the edit is ready.
   const deadline = Date.now() + EDIT_TIMEOUT_MS;
@@ -1740,6 +1749,7 @@ export async function runContinue(job: Job): Promise<string[]> {
     const before = await mediaIds(page);
     job.progress = "generating";
     await page.getByRole("button", { name: "Start generation" }).click();
+    markCharged(job);
 
     // The agent sometimes still stops to ask which tool to use. Nobody is watching an unattended run, so answer it.
     for (let i = 0; i < 12; i++) {

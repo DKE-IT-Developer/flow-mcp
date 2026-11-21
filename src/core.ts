@@ -10,8 +10,9 @@ import { KOKORO_DEFAULT_VOICE, KOKORO_MB, KOKORO_VOICES, kokoroReady, speakWithK
 import { extractFirstFrame, extractFrameAt, extractLastFrame } from "./chain.js";
 import { burnCaptions, captionedName, captionSetup, previewCaptions, transcribe } from "./captions.js";
 import { presenter } from "./presenter.js";
-import { appendLog, budgetLeft, budgetMessage, checkFrameRefs, checkReport, estimateCost, gate, isDerivedRef, loadProduction, MEASURED_NOTE, overBudget, paidVideo, resolveSceneFrames } from "./produksi.js";
-import { characterLook, createCharacter, createProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
+import { appendLog, budgetLeft, TIER_MODELS, budgetMessage, checkFrameRefs, checkReport, estimateCost, gate, isDerivedRef, loadProduction, MEASURED_NOTE, overBudget, paidVideo, resolveSceneFrames } from "./produksi.js";
+import { characterLook, createCharacter, createProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration, takeCharged } from "./flow.js";
+import { checkBudget } from "./periksa.js";
 import { JobQueue, type Job, type SceneParams } from "./queue.js";
 import { earlierImages, imageKey, rememberImages } from "./dedup.js";
 import { BIN, COMPUTER, moveToBin } from "./platform.js";
@@ -519,11 +520,8 @@ export const VOICES = [
 // hand-over-mouth giggle, intensity 4), so price bought no naturalness; Omni 1.2 Flash followed the written beats
 // (eyes, then fingertips, then a smile from the eyes, intensity 3). Hence hero = two Omni takes to choose from, not Veo
 // Quality. A Veo draft does NOT preview Omni's acting: if the draft is right, keep the draft clip itself.
-const TIERS = {
-  draft: "Veo 3.1 - Lite [Lower Priority]|Veo 3.1 - Lite",
-  final: "Omni 1.2 Flash",
-  hero: "Omni 1.2 Flash",
-} as const;
+// The models live in produksi.ts (TIER_MODELS) so the production gates judge free/paid from the same strings.
+const TIERS = TIER_MODELS;
 
 // Scenes with people get the acting rules that made shots read as filmed rather than generated (sinema-natural 04).
 const PEOPLE = /\b(she|he|her|his|they|woman|women|man|men|girl|boy|person|people|talent|face|hands?|fingers?|smiles?|eyes)\b/i;
@@ -578,8 +576,10 @@ export function buildParams(
     output_dir: ctx.output_dir,
     file_stem: ctx.file_stem,
     // Production mode only: carried to the job (credit log). Elsewhere they are dropped, so params stay as before.
-    // tier rides along with shot so the worker can re-run the gates (draft = free) after resolving shot:/crop: frames.
-    ...(ctx.production && shot ? { shot, ...(tier ? { tier } : {}) } : {}),
+    // tier rides along (with or without shot) so the worker re-runs the gates on the same scene after resolving
+    // shot:/crop: frames; free/paid itself is decided from the effective model (paidVideo).
+    ...(ctx.production && shot ? { shot } : {}),
+    ...(ctx.production && tier ? { tier } : {}),
     ...(ctx.production && force ? { force } : {}),
     ...(ctx.production && crop_center ? { crop_center } : {}),
   };
@@ -648,6 +648,28 @@ export function logDone(job: Job, files: string[]): string[] {
   return files;
 }
 
+// A paid action was submitted to Flow (credits spent) but the job failed before a file came back (download error,
+// timeout): log it `charged` so the production budget still counts it, once per job id like every other entry.
+export function logCharged(job: Job): void {
+  if (!takeCharged(job)) return;
+  const s = job.params;
+  try {
+    if (!loadProduction(s.output_dir)) return;
+    const est = s.estimate !== undefined;
+    if (!est && !((job.credits ?? 0) > 0)) return; // free (quote 0) submissions cost nothing
+    const credits = est ? Math.max(s.estimate!, 0) : job.credits;
+    appendLog(s.output_dir, {
+      t: new Date().toISOString(), job: job.id, shot: s.shot, tier: s.tier, charged: true,
+      quote: est ? s.estimate : job.credits, credits,
+      ...(est ? { estimate: true } : {}),
+      ...(s.force ? { force: s.force } : {}),
+    });
+    job.note = [job.note, `gagal setelah dikirim ke Flow: ${credits ?? "?"} kredit tetap dibebankan ke anggaran`].filter(Boolean).join(" · ");
+  } catch (e) {
+    job.note = [job.note, `log produksi gagal ditulis: ${(e as Error).message}`].filter(Boolean).join(" · ");
+  }
+}
+
 // Indirection so the self-check can stub the Flow run and prove a refused job never reaches it.
 export const runners = { generation: runGeneration };
 
@@ -677,7 +699,7 @@ export class LocalCore implements Core {
     // parent clip may have been chosen after queueing). A face below 0.80 fails the job here, before Flow is opened.
     if (isDerivedRef(job.params.first_frame) || isDerivedRef(job.params.last_frame)) {
       const p = job.params;
-      const notes = await resolveSceneFrames(p.output_dir, p, { exempt: !!p.force?.trim() || !paidVideo(p), tag: job.id });
+      const notes = await resolveSceneFrames(p.output_dir, p, { exempt: !!p.force?.trim() || !paidVideo(p), tag: job.id, budget: checkBudget(job.id) });
       job.note = [job.note, ...notes].filter(Boolean).join(" · ");
       // G2 was deferred at queue time for a derived pair: re-run the gates now that the frames are files, so a pair
       // whose face check did not record a pass (produksi.json edited meanwhile, say) fails here, before Flow and credits.
@@ -690,10 +712,15 @@ export class LocalCore implements Core {
       const left = budgetLeft(job.params.output_dir);
       if (left !== undefined && overBudget(left, job.params.estimate)) throw new Error(budgetMessage(left, job.params.estimate, "perkiraan"));
     }
-    if (job.params.continue_from) return logDone(job, await runContinue(job));
-    if (job.params.agent_scenes) return runAgentBatch(job);
-    if (job.params.edit_asset) return logDone(job, await runEdit(job));
-    const files = await runners.generation(job);
+    if (job.params.agent_scenes && !job.params.continue_from) return runAgentBatch(job);
+    let files: string[];
+    try {
+      files = job.params.continue_from ? await runContinue(job) : job.params.edit_asset ? await runEdit(job) : await runners.generation(job);
+    } catch (e) {
+      logCharged(job);
+      throw e;
+    }
+    takeCharged(job);
     if (job.params.dedup_key && files.length) rememberImages(job.params.dedup_key, files);
     return logDone(job, files);
   });
@@ -1165,6 +1192,12 @@ if (process.argv[1]?.endsWith("core.js") && process.argv.includes("--cek")) {
     assert(msg.includes("G2") && added.length === 0, "keyframe belum lulus -> ditolak");
     await gen([{ prompt: "a", tier: "draft" }, { prompt: "b", type: "image" }]);
     assert(added.length === 2 && !added.some((p) => "shot" in p || "force" in p), "draft & gambar lolos tanpa shot");
+    assert(added[0].tier === "draft", "mode produksi: tier dibawa ke job walau tanpa shot");
+    // G1/G2 bypass: tier draft with an explicit Omni model is Omni (paid) -> refused without shot, nothing queued
+    added = [];
+    msg = "";
+    try { await gen([{ prompt: "a", tier: "draft", model: "Omni 1.2 Flash" }]); } catch (e) { msg = (e as Error).message; }
+    assert(msg.includes("wajib shot") && added.length === 0, `draft + model Omni tanpa shot -> ditolak (${msg})`);
     added = [];
     const out = (await gen([{ prompt: "c", tier: "final", shot: "S01", force: "uji sudut" }])) as any;
     assert(added[0].shot === "S01" && added[0].force === "uji sudut", "shot/force dibawa ke params job");
@@ -1239,6 +1272,18 @@ if (process.argv[1]?.endsWith("core.js") && process.argv.includes("--cek")) {
     await runner(okJob);
     assert(flowCalls === 1 && okJob.params.first_frame!.includes("frame/turunan") && okJob.params.first_frame!.includes("-jr3"), `pasangan lulus -> Flow dipanggil sekali dengan frame turunan (${okJob.params.first_frame})`);
     setFaceScorer(undefined);
+    // charged but no file (download failed after Start generation): counted once per job id; unsubmitted failure not
+    const { markCharged } = await import("./flow.js");
+    const spent0 = spentCredits(dir);
+    runners.generation = async (j: Job) => { j.credits = 24; markCharged(j); throw new Error("unduh gagal"); };
+    const cj = { id: "jc1", status: "running", params: { prompt: "x", type: "video", max_credits: 50, output_dir: dir, file_stem: "scene-98", shot: "S01" }, files: [], attempts: 1, createdAt: "" } as unknown as Job;
+    for (let k = 0; k < 2; k++) { try { await runner(cj); } catch { /* expected */ } }
+    assert(spentCredits(dir) - spent0 === 24 && cj.note!.includes("tetap dibebankan"), `gagal setelah dikirim: 24 kredit sekali per job (${spentCredits(dir) - spent0})`);
+    assert(latestClip(dir, "S01") !== undefined && !rd(join(dir, "produksi-log.jsonl"), "utf8").split("\n").some((l) => l.includes('"jc1"') && l.includes('"file"')), "entri charged tanpa file");
+    runners.generation = async (j: Job) => { j.credits = 24; throw new Error("gagal sebelum kirim"); };
+    const nj = { ...cj, id: "jc2", note: undefined, params: { ...cj.params } } as Job;
+    try { await runner(nj); } catch { /* expected */ }
+    assert(spentCredits(dir) - spent0 === 24, "gagal sebelum Start generation -> tak dibebankan");
     runners.generation = realGen;
     added = [];
     msg = "";

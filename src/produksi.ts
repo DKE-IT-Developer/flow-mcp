@@ -171,7 +171,8 @@ export type ClipQa = { motion?: string; face_median?: number; speech?: string; v
 export type Label = { kind: "voice" | "ambience"; verdict: "same" | "different" | "jump" | "ok"; file?: string; at: string };
 export type ShotQa = { keyframes?: { passed: boolean; face?: number; by: string; at: string }; clips?: Record<string, ClipQa>; labels?: Label[] };
 export type Qa = Record<string, ShotQa>;
-export type LogEntry = { t: string; job: string; shot?: string; file?: string; tier?: string; quote?: number; credits?: number; estimate?: boolean; force?: string; measured?: number };
+// charged: job yang sudah dikirim ke Flow (kredit terpakai) tetapi gagal sebelum ada berkas -> tetap dihitung anggaran.
+export type LogEntry = { t: string; job: string; shot?: string; file?: string; tier?: string; quote?: number; credits?: number; estimate?: boolean; force?: string; measured?: number; charged?: boolean };
 
 const QA_FILE = "qa.json";
 let tmpSeq = 0;
@@ -224,11 +225,14 @@ function readLog(projectDir: string): LogEntry[] {
   return out;
 }
 
-/** Kredit terpakai: hanya entri ber-file (job selesai), sekali per job id (retry tak menggandakan). `measured` (selisih saldo) diabaikan. */
+/**
+ * Kredit terpakai: entri ber-file (job selesai) atau `charged` (dikirim ke Flow lalu gagal unduh), sekali per job id
+ * (retry tak menggandakan). `measured` (selisih saldo) diabaikan.
+ */
 export function spentCredits(projectDir: string): number {
   const byJob = new Map<string, number>();
   for (const e of readLog(projectDir)) {
-    if (!e.file) continue;
+    if (!e.file && !e.charged) continue;
     const v = e.credits ?? e.quote;
     // Entri belakangan tanpa harga (mis. berkas varian kedua) tidak menghapus harga yang sudah tercatat.
     if (v !== undefined) byJob.set(e.job, v);
@@ -250,8 +254,15 @@ export function latestClip(projectDir: string, shot: string): string | undefined
 export type GateScene = { shot?: string; force?: string; tier?: string; type: string; model?: string; first_frame?: string; last_frame?: string };
 export type GateResult = { ok: true; force?: string; derived?: true } | { ok: false; reason: string };
 
-/** Video berbayar = video selain tier draft (tanpa tier = model Flow saat ini, dianggap berbayar). */
-export const paidVideo = (s: { type: string; tier?: string }) => s.type === "video" && s.tier !== "draft";
+// Model per tier (dipakai core.ts buildParams). Gratis/berbayar diputuskan dari model EFEKTIF, bukan nama tier:
+// { tier: "draft", model: "Omni 1.2 Flash" } memakai Omni (berbayar), jadi tidak boleh lolos gerbang sebagai draft.
+export const DRAFT_MODEL = "Veo 3.1 - Lite [Lower Priority]|Veo 3.1 - Lite";
+export const TIER_MODELS = { draft: DRAFT_MODEL, final: "Omni 1.2 Flash", hero: "Omni 1.2 Flash" } as const;
+/** Model yang benar-benar dipakai: `model` eksplisit, kalau tidak model tier; undefined = model Flow saat ini. */
+export const effectiveModel = (s: { model?: string; tier?: string }): string | undefined =>
+  s.model ?? (s.tier && s.tier in TIER_MODELS ? TIER_MODELS[s.tier as keyof typeof TIER_MODELS] : undefined);
+/** Video berbayar = video yang model efektifnya bukan model draft (tanpa model/tier = model Flow saat ini, berbayar). */
+export const paidVideo = (s: { type: string; tier?: string; model?: string }) => s.type === "video" && effectiveModel(s) !== DRAFT_MODEL;
 
 /**
  * G1 (lint shot bersih) + G2 (keyframe lulus di qa.json) untuk satu scene, sebelum job dibuat.
@@ -339,8 +350,22 @@ let faceScorer: FaceScorer | undefined;
 export function setFaceScorer(f?: FaceScorer): void {
   faceScorer = f;
 }
-// Impor dinamis: periksa.ts mengimpor modul ini, jadi impor statis akan melingkar.
-const scoreFace: FaceScorer = async (img, refs) => (faceScorer ?? (await import("./periksa.js")).faceScore)(img, refs);
+type Budget = { left: number };
+// Impor dinamis: periksa.ts mengimpor modul ini, jadi impor statis akan melingkar. Skrip sungguhan: SATU panggilan
+// cek_konsisten untuk semua kandidat (tenggat job ikut); tiruan uji: per gambar.
+async function scoreFaces(images: string[], refs: string[], budget?: Budget): Promise<(number | null)[]> {
+  if (faceScorer) {
+    const f = faceScorer;
+    return Promise.all(images.map((i) => f(i, refs)));
+  }
+  return (realScores ?? (await import("./periksa.js")).faceScores)(images, refs, budget);
+}
+type FaceScores = (images: string[], refs: string[], budget?: Budget) => Promise<(number | null)[]>;
+let realScores: FaceScores | undefined;
+/** Dipanggil periksa.ts saat dimuat (menghindari impor dinamis melingkar saat periksa sendiri sedang dievaluasi). */
+export function registerFaceScores(f: FaceScores): void {
+  realScores = f;
+}
 
 const SHOT_REF = /^shot:([A-Za-z0-9_-]+)(?:@(\d+(?:\.\d+)?))?$/;
 const CROP_REF = /^crop:(\d+(?:\.\d+)?)$/;
@@ -431,7 +456,8 @@ function faceRefs(projectDir: string, p: Production, shot?: string): string[] {
 
 // strict: pasangan turunan -> ref wajah HANYA dari shot tujuan (tanpa cadangan shot sumber); tanpa ref = melempar.
 // tag: id job, masuk nama berkas agar job yang berjalan bersamaan tidak saling menimpa.
-export type FrameOpts = { target?: string; role?: "start" | "end"; source?: string; center?: [number, number]; strict?: boolean; tag?: string };
+// budget: tenggat cek per job (periksa.checkBudget); habis -> pencarian gagal sebelum Flow (tanpa kredit).
+export type FrameOpts = { target?: string; role?: "start" | "end"; source?: string; center?: [number, number]; strict?: boolean; tag?: string; budget?: Budget };
 
 /**
  * `shot:S02@4.2` -> frame dari klip S02 (chosen / terbaru) dalam 4,2 ± 0,5 dtk (tanpa @: 0,5 dtk terakhir) dengan skor
@@ -479,11 +505,12 @@ export async function resolveFrameRef(projectDir: string, ref: string, at?: numb
       best = cands.reduce((a, b) => (Math.abs(b.t - center) < Math.abs(a.t - center) ? b : a));
     } else {
       let failure = "";
-      for (const c of cands) {
-        let v: number | null;
-        try { v = await scoreFace(c.file, refs); } catch (e) { v = null; failure ||= (e as Error).message.split("\n")[0]; }
+      let scores: (number | null)[] = [];
+      try { scores = await scoreFaces(cands.map((c) => c.file), refs, opts.budget); } catch (e) { failure = (e as Error).message.split("\n")[0]; }
+      cands.forEach((c, i) => {
+        const v = scores[i] ?? null;
         if (v !== null && (best?.face === undefined || v > best.face)) best = { ...c, face: v };
-      }
+      });
       if (best?.face === undefined || best.face < FACE_PASS) {
         const why = best?.face !== undefined ? `skor wajah tertinggi ${best.face.toFixed(2)} di ${best.t.toFixed(2)} dtk` : failure ? `cek wajah gagal: ${failure}` : "wajah tidak terdeteksi";
         throw new Error(`${ref}: tak ada frame dengan wajah ≥ ${FACE_PASS.toFixed(2)} dalam ${lo.toFixed(2)}–${hi.toFixed(2)} dtk (${why}). Ganti sambungan ke cut-on-action dengan START baru.`);
@@ -503,7 +530,7 @@ export async function resolveFrameRef(projectDir: string, ref: string, at?: numb
  * frame/turunan/. Sisi sumber dulu, lalu crop dari hasilnya. START shot: (wajah ≥ 0,80) + END crop (atau kebalikannya)
  * -> keyframes shot tujuan dicatat lulus di qa.json (by "turunan"). Gagal -> melempar (job gagal sebelum Flow dibuka).
  */
-export async function resolveSceneFrames(projectDir: string, scene: FrameScene, opts: { exempt?: boolean; tag?: string } = {}): Promise<string[]> {
+export async function resolveSceneFrames(projectDir: string, scene: FrameScene, opts: { exempt?: boolean; tag?: string; budget?: Budget } = {}): Promise<string[]> {
   if (!isDerivedRef(scene.first_frame) && !isDerivedRef(scene.last_frame)) return [];
   checkFrameRefs(projectDir, scene);
   const p = needProduction(projectDir);
@@ -527,7 +554,7 @@ export async function resolveSceneFrames(projectDir: string, scene: FrameScene, 
       const otherKey = key === "first_frame" ? "last_frame" : "first_frame";
       const other = resolved[otherKey] ?? scene[otherKey];
       const r = await resolveFrameRef(projectDir, ref, key === "first_frame" ? scene.first_frame_at : undefined, {
-        target: scene.shot, role, source: other, center: scene.crop_center, strict: strict && isShotRef(ref), tag: opts.tag,
+        target: scene.shot, role, source: other, center: scene.crop_center, strict: strict && isShotRef(ref), tag: opts.tag, budget: opts.budget,
       });
       resolved[key] = r.path;
       if (r.face !== undefined) face = r.face;
@@ -759,6 +786,11 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   const ok3 = gate(gd, { ...fin, shot: "S03" });
   assert(ok3.ok === true && ok3.force === undefined, "S03 lint bersih + keyframe lulus -> ok");
   assert(gate(gd, { type: "video", tier: "draft" }).ok === true, "draft bebas gerbang (tanpa shot/keyframe)");
+  // Gratis/berbayar dari model EFEKTIF: tier draft + model Omni = Omni berbayar (bukan bypass G1/G2).
+  assert(paidVideo({ type: "video", tier: "draft", model: "Omni 1.2 Flash" }), "tier draft + model Omni = berbayar");
+  assert(!paidVideo({ type: "video", model: DRAFT_MODEL }) && !paidVideo({ type: "video", tier: "draft" }), "model draft (eksplisit / dari tier) = gratis");
+  assert(paidVideo({ type: "video", model: "Veo 3.1 - Lite" }) && paidVideo({ type: "video", tier: "final" }), "model lain / final = berbayar");
+  assert(why(gate(gd, { type: "video", tier: "draft", model: "Omni 1.2 Flash" })).includes("wajib shot"), "draft + Omni tanpa shot -> ditolak G1");
   assert(gate(gd, { type: "image" }).ok === true, "gambar bebas gerbang");
   // anggaran: budget 48, terpakai 24, quote 30 -> sisa 24 -> tolak
   assert(budgetLeft(gd) === 48, "budget penuh tanpa log");
