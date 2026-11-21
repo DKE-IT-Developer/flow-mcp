@@ -8,8 +8,7 @@ import { extractZip } from "./platform.js";
 import { forgetUpload, knownAssetNames, rememberUpload } from "./dedup.js";
 import { motionCheck } from "./motion.js";
 import { postChecks } from "./periksa.js";
-import { loadProduction } from "./produksi.js";
-import { g3Check } from "./produksi.js";
+import { g3Check, loadProduction } from "./produksi.js";
 
 export interface FlowState {
   url: string;

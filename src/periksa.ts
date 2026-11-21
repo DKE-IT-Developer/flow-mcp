@@ -1,8 +1,8 @@
 // Cek otomatis setelah unduh (tahap 1): wajah, ucapan, suara lewat skrip plugin sinema-natural (SINEMA_SCRIPTS).
 // Tidak pernah melempar ke pemanggil: skrip hilang / timeout / keluaran aneh = catatan "dilewati: <alasan>", job tetap done.
 // Self-check: `node dist/periksa.js --cek`
-import { execFile } from "node:child_process";
-import { existsSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
 import { loadProduction, mergeQa, readQa, resolvePrivate, type ClipQa, type Production } from "./produksi.js";
 
@@ -22,11 +22,22 @@ function scriptsDir(): string {
 async function runScript(name: string, args: string[]): Promise<unknown> {
   const script = join(scriptsDir(), name);
   if (!existsSync(script)) throw new Skip(`${name} tidak terpasang`);
+  // Grup proses sendiri (detached): saat timeout seluruh grup dimatikan, agar anak Python tidak jadi yatim yang memakan CPU.
   const out = await new Promise<string>((resolve, reject) => {
-    execFile("nice", ["-n", "10", "uv", "run", script, ...args], { timeout: timeoutMs(), maxBuffer: 1 << 24, encoding: "utf8" }, (err, stdout, stderr) => {
+    const child = spawn("nice", ["-n", "10", "uv", "run", script, ...args], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "", timedOut = false;
+    child.stdout.on("data", (d) => { if (stdout.length < 1 << 24) stdout += d; });
+    child.stderr.on("data", (d) => { if (stderr.length < 1 << 20) stderr += d; });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-child.pid!, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+    }, timeoutMs());
+    child.on("error", (e) => { clearTimeout(timer); reject(new Skip(`${name} gagal: ${e.message}`)); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) return reject(new Skip("batas waktu"));
       // cek_ucapan keluar non-nol bila MERAH; JSON di stdout tetap valid -> pakai bila ada.
-      if (err && (err as { killed?: boolean }).killed) return reject(new Skip("batas waktu"));
-      if (err && !stdout?.trim()) return reject(new Skip(`${name} gagal: ${String(stderr || err.message).trim().split("\n").pop()}`));
+      if (code !== 0 && !stdout.trim()) return reject(new Skip(`${name} gagal: ${stderr.trim().split("\n").pop() || `keluar kode ${code}`}`));
       resolve(stdout);
     });
   });
@@ -153,6 +164,21 @@ if (process.argv[1]?.endsWith("periksa.js") && process.argv.includes("--cek")) {
     assert(n.includes("dilewati: suara (cek_suara.py tidak terpasang)"), `hilang: ${n}`);
     assert(n.includes("dilewati: ucapan (cek_ucapan.py: keluaran bukan JSON)"), `bukan json: ${n}`);
     assert(n.some((l) => l.startsWith("dilewati: wajah")), `crash: ${n}`);
+    // 5b. stderr kosong + exit non-nol -> alasan tidak kosong; anak proses dimatikan saat timeout
+    py("cek_konsisten.py", "raise SystemExit(3)\n");
+    n = await postChecks(join(proj, "S01.mp4"), proj, shots[0]);
+    assert(n.some((l) => l.startsWith("dilewati: wajah (") && !l.endsWith(": )") && !l.includes(": )")), `alasan kosong: ${n}`);
+    const pidFile = join(root, "anak.pid");
+    py("cek_konsisten.py", `import subprocess, time\np = subprocess.Popen(["sleep", "30"])\nopen(${JSON.stringify(pidFile)}, "w").write(str(p.pid))\ntime.sleep(30)\n`);
+    n = await postChecks(join(proj, "S01.mp4"), proj, shots[0]);
+    assert(n.includes("dilewati: wajah (batas waktu)"), `timeout anak: ${n}`);
+    const kid = Number(readFileSync(pidFile, "utf8"));
+    await new Promise((r) => setTimeout(r, 300));
+    let alive = true;
+    try { process.kill(kid, 0); } catch { alive = false; }
+    assert(!alive, "anak proses (sleep 30) harus mati bersama grupnya");
+    // 5c. cek ulang yang dilewati menghapus face_median lama
+    assert(readQa(proj).S01.clips!["S01.mp4"].face_median === undefined, "face_median lama terhapus saat cek ulang dilewati");
     // 6. shot tanpa pemeran/dialog: hanya wajah dilewati
     n = await postChecks(join(proj, "S01.mp4"), proj, shots[1]);
     assert(n.length === 1 && n[0].includes("tanpa referensi wajah"), `S02: ${n}`);
