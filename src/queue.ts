@@ -37,6 +37,12 @@ export interface SceneParams {
   file_stem: string;
   // Local patch: identity of an image request (dedup.ts), recorded with its files when the job finishes.
   dedup_key?: string;
+  // Production mode (produksi.json): the shot this job makes and the reason its G1/G2 gates were forced, if any.
+  // output_dir is the project folder, so the owner process finds produksi.json and the credit log from there.
+  shot?: string;
+  force?: string;
+  // Production mode, tools without a Flow quote (edit, continue): the conservative credit estimate checked against the budget.
+  estimate?: number;
 }
 
 export interface Job {

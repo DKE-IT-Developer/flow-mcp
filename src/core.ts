@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -8,9 +9,9 @@ import { KOKORO_DEFAULT_VOICE, KOKORO_MB, KOKORO_VOICES, kokoroReady, speakWithK
 import { extractFirstFrame, extractFrameAt, extractLastFrame } from "./chain.js";
 import { burnCaptions, captionedName, captionSetup, previewCaptions, transcribe } from "./captions.js";
 import { presenter } from "./presenter.js";
-import { checkReport } from "./produksi.js";
+import { appendLog, budgetLeft, budgetMessage, checkReport, estimateCost, gate, loadProduction, MEASURED_NOTE, overBudget } from "./produksi.js";
 import { characterLook, createCharacter, createProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
-import { JobQueue, type Job } from "./queue.js";
+import { JobQueue, type Job, type SceneParams } from "./queue.js";
 import { earlierImages, imageKey, rememberImages } from "./dedup.js";
 import { BIN, COMPUTER, moveToBin } from "./platform.js";
 import { TECHNIQUES, techniqueById } from "./techniques.js";
@@ -85,7 +86,17 @@ const sceneSchema = z.object({
     .boolean()
     .optional()
     .describe("Continue the previous scene in this call: its last frame becomes this scene's first frame. Not valid on the first scene or together with first_frame."),
+  shot: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("Projects with a produksi.json only: the shot id this scene makes (e.g. 'S03'). Every paid video there needs one, a lint-clean shot and passed START/END keyframes in qa.json; the clip is logged against the shot's credit budget. Ignored elsewhere."),
+  force: z
+    .string()
+    .optional()
+    .describe("Projects with a produksi.json only: a reason (e.g. 'uji sudut kamera') to skip the lint and keyframe gates for this scene. It is logged and returned on the job. The credit budget can never be forced: raise budget_credits in produksi.json after the user agrees."),
 });
+export type Scene = z.infer<typeof sceneSchema>;
 
 // Raw shapes double as MCP input schemas and, wrapped in z.object, as HTTP body validators.
 const captionFields = {
@@ -516,6 +527,115 @@ const PERFORMANCE =
 
 const BUSY = "A generation is running in the Flow tab. Wait for it to finish (flow_wait), then retry.";
 
+// The params one scene of flow_generate queues, kept pure so the opt-in proof (`node dist/core.js --cek`) can compare
+// them with what generate() queued before production mode existed.
+export function buildParams(
+  { chain_previous, reference_previous, technique, angle, outfit, on_screen_text, regenerate: _regenerate, tier, performance, shot, force, ...scene }: Scene,
+  ctx: { prevId?: string; output_dir: string; file_stem: string },
+): { params: SceneParams; key?: string } {
+  if (scene.type === "video" && tier && !scene.model) {
+    scene.model = TIERS[tier];
+    if (tier === "hero") scene.variants ??= 2; // two takes; quote ~48, so max_credits must be raised on purpose
+    if (!scene.model.startsWith("Omni")) delete scene.resolution, delete scene.duration; // Veo: fixed 8 s, no resolution radio
+  }
+  const acting = scene.type === "video" && performance !== false && PEOPLE.test(scene.prompt) ? ` ${PERFORMANCE}` : "";
+  const phrase = technique ? techniqueById(technique)!.phrase : "";
+  const opening = angle ? `${techniqueById(angle)!.phrase} ` : "";
+  // A referenced character must come out identical, not merely similar, so the scene says so explicitly. The
+  // wording stays medium-neutral: the same lock has to serve a flat cartoon character and a photoreal avatar.
+  const cast = (scene.reference_images ?? [])
+    .filter((r) => r.startsWith("asset:"))
+    .map((r) => r.slice(6).trim())
+    .filter((n) => characterLook(n) !== undefined || /^[\w .'-]{1,60}$/.test(n));
+  // With an outfit the lock still pins face, hair and build, but the clothes come from the scene: otherwise the
+  // saved look (Skye's denim shirt) fights a costume the prompt asks for.
+  const lock = cast.length
+    ? ` CHARACTER LOCK — ${cast.join(" and ")} must match the reference image exactly, as if copying it: same head shape and size, same face, same eyes, same hair, same skin, same build and proportions,${outfit ? "" : " same clothing items in the same colours,"} same hands, and the same rendering style and level of realism as the reference. Never redesign, ${outfit ? "" : "restyle, "}re-proportion, re-age or re-colour them${outfit ? "" : ", and never swap an item for a similar one"}.${cast
+        .map((n) => (characterLook(n) ? ` ${n} is exactly: ${characterLook(n)}.` : ""))
+        .join("")}${outfit ? ` WARDROBE IN THIS SCENE: ${outfit.trim().replace(/\.$/, "")}. This replaces any clothing in the reference image or the description above, and stays identical for the whole scene.` : ""}`
+    : "";
+  // Omni burns its own subtitles into talking clips now and then, garbled ("thyel", "voch"), even when the prompt
+  // says "no captions" near the end (protein soda clip 1, 15 credits). Every video therefore opens AND closes on it,
+  // unless the scene really wants words in the picture. Captions are added afterwards by flow_captions.
+  const noText = scene.type !== "image" && !on_screen_text;
+  const textFirst = noText ? "NO SUBTITLES, NO CAPTIONS, NO TEXT OF ANY KIND ON SCREEN. " : "";
+  const textLast = noText
+    ? " NO TEXT ON SCREEN: never add subtitles, captions, titles, speech transcripts, words or letters anywhere in the picture, at any moment; any speech is heard only, never written."
+    : "";
+  const inherit = reference_previous
+    ? " Match the previous image exactly for the subject's appearance, colour palette, lighting and rendering style; this is the same scene a moment later."
+    : "";
+  const params = {
+    ...scene,
+    prompt: `${textFirst}${opening}${scene.prompt.trim().replace(/\.?$/, ".")}${phrase ? ` ${phrase}` : ""}${lock}${inherit}${acting}${textLast}`,
+    chain_from: chain_previous ? ctx.prevId : undefined,
+    reference_from: reference_previous ? ctx.prevId : undefined,
+    output_dir: ctx.output_dir,
+    file_stem: ctx.file_stem,
+    // Production mode only: carried to the job (G3 at the quote, credit log). Absent keys keep params as before.
+    ...(shot ? { shot } : {}),
+    ...(force ? { force } : {}),
+  };
+  // Local patch: the same image request again returns the earlier image instead of another tile in Flow. Scenes
+  // that reference the previous scene depend on it, so they are always generated.
+  const key = scene.type === "image" && !reference_previous ? imageKey(params) : undefined;
+  return { params, key };
+}
+
+// ---- Production mode (produksi.json) helpers: inert for projects without that file. ----
+
+// Seconds of a clip this project downloaded itself: Flow tiles are renamed "<project>-<stem>", the file is <stem>.mp4.
+function localClipSeconds(output_dir: string, asset: string): number | undefined {
+  const prefix = `${basename(output_dir)}-`;
+  const stem = asset.startsWith(prefix) ? asset.slice(prefix.length) : asset;
+  const file = join(output_dir, `${stem}.mp4`);
+  if (!/^[\w.-]+$/.test(stem) || !existsSync(file)) return undefined;
+  try {
+    const out = execFileSync(process.env.FLOW_MCP_FFPROBE ?? "ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file], { timeout: 10_000 });
+    const s = Number(String(out).trim());
+    return Number.isFinite(s) && s > 0 ? s : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Paid tools with no Flow quote (edit, continue/Extend): a conservative estimate checked against the budget before the
+// job is queued. Returns the extra job params ({} outside production mode, so those params stay as they were).
+function estimateUnquoted(output_dir: string, kind: "edit" | "continue", asset?: string): { estimate?: number } {
+  const left = budgetLeft(output_dir);
+  if (left === undefined) return {};
+  const estimate = estimateCost(kind, kind === "edit" && asset ? localClipSeconds(output_dir, asset) : undefined);
+  if (overBudget(left, estimate)) throw new Error(budgetMessage(left, estimate, "perkiraan"));
+  return { estimate };
+}
+
+// After a job is done: one credit-log line per downloaded video (spentCredits counts each job id once). A failure to
+// log must not fail a job whose credits are already spent, so it only adds a note.
+export function logDone(job: Job, files: string[]): string[] {
+  const s = job.params;
+  try {
+    if (!loadProduction(s.output_dir)) return files;
+    const t = new Date().toISOString();
+    const est = s.estimate !== undefined;
+    for (const file of files.filter((f) => /\.(mp4|webm|mov)$/i.test(f))) {
+      appendLog(s.output_dir, {
+        t, job: job.id, shot: s.shot, file: basename(file),
+        quote: est ? s.estimate : job.credits,
+        credits: job.credits ?? s.estimate,
+        ...(est ? { estimate: true } : {}),
+        ...(s.force ? { force: s.force } : {}),
+      });
+    }
+    if (est) {
+      const real = job.credits !== undefined ? `${job.credits} kredit, ${MEASURED_NOTE}` : "saldo tak terbaca, perkiraan yang dicatat";
+      job.note = [job.note, `perkiraan ${s.estimate} kredit; ${real}`].filter(Boolean).join(" · ");
+    }
+  } catch (e) {
+    job.note = [job.note, `log produksi gagal ditulis: ${(e as Error).message}`].filter(Boolean).join(" · ");
+  }
+  return files;
+}
+
 export class LocalCore implements Core {
   private queue: JobQueue = new JobQueue(async (job) => {
     const { chain_from, reference_from } = job.params;
@@ -538,12 +658,18 @@ export class LocalCore implements Core {
       if (!clip) throw new Error(`chain_previous: the previous scene (${chain_from}) produced no video, so this scene was skipped.`);
       job.params.first_frame = await extractLastFrame(clip);
     }
-    if (job.params.continue_from) return runContinue(job);
+    // Production mode: tools without a Flow quote are re-checked against the budget right before they run, because
+    // jobs ahead of them in the queue may have spent it since they were queued.
+    if (job.params.estimate !== undefined) {
+      const left = budgetLeft(job.params.output_dir);
+      if (left !== undefined && overBudget(left, job.params.estimate)) throw new Error(budgetMessage(left, job.params.estimate, "perkiraan"));
+    }
+    if (job.params.continue_from) return logDone(job, await runContinue(job));
     if (job.params.agent_scenes) return runAgentBatch(job);
-    if (job.params.edit_asset) return runEdit(job);
+    if (job.params.edit_asset) return logDone(job, await runEdit(job));
     const files = await runGeneration(job);
     if (job.params.dedup_key && files.length) rememberImages(job.params.dedup_key, files);
-    return files;
+    return logDone(job, files);
   });
 
   async status({ detailed }: Args<"status">) {
@@ -564,64 +690,37 @@ export class LocalCore implements Core {
     if (badAngle) throw new Error(`Unknown angle "${badAngle.angle}". Call flow_techniques with category "angle" for valid ids.`);
 
     const output_dir = projectDir(project);
+    // Production gates G1/G2 (produksi.json only; without it every scene passes untouched). Checked for every scene
+    // before any job exists, so a refused scene never leaves half a batch queued.
+    const gates = scenes.map((s) => gate(output_dir, s));
+    const refused = gates.flatMap((g, i) => (g.ok ? [] : [`Scene ${i + 1}: ${g.reason}`]));
+    if (refused.length) throw new Error(refused.join("\n"));
     // Continue numbering after whatever is already on disk or queued, so reruns never overwrite earlier scenes.
     const onDisk = existsSync(output_dir) ? readdirSync(output_dir).map((f) => Number(f.match(/^scene-(\d+)/)?.[1] ?? 0)) : [];
     const queued = this.queue.list().filter((j) => j.params.output_dir === output_dir).map((j) => Number(j.params.file_stem.match(/\d+/)?.[0] ?? 0));
     const offset = Math.max(0, ...onDisk, ...queued);
     const jobs: Job[] = [];
     let reused = 0;
-    for (const [i, { chain_previous, reference_previous, technique, angle, outfit, on_screen_text, regenerate, tier, performance, ...scene }] of scenes.entries()) {
-      if (scene.type === "video" && tier && !scene.model) {
-        scene.model = TIERS[tier];
-        if (tier === "hero") scene.variants ??= 2; // two takes; quote ~48, so max_credits must be raised on purpose
-        if (!scene.model.startsWith("Omni")) delete scene.resolution, delete scene.duration; // Veo: fixed 8 s, no resolution radio
-      }
-      const acting = scene.type === "video" && performance !== false && PEOPLE.test(scene.prompt) ? ` ${PERFORMANCE}` : "";
-      const phrase = technique ? techniqueById(technique)!.phrase : "";
-      const opening = angle ? `${techniqueById(angle)!.phrase} ` : "";
-      // A referenced character must come out identical, not merely similar, so the scene says so explicitly. The
-      // wording stays medium-neutral: the same lock has to serve a flat cartoon character and a photoreal avatar.
-      const cast = (scene.reference_images ?? [])
-        .filter((r) => r.startsWith("asset:"))
-        .map((r) => r.slice(6).trim())
-        .filter((n) => characterLook(n) !== undefined || /^[\w .'-]{1,60}$/.test(n));
-      // With an outfit the lock still pins face, hair and build, but the clothes come from the scene: otherwise the
-      // saved look (Skye's denim shirt) fights a costume the prompt asks for.
-      const lock = cast.length
-        ? ` CHARACTER LOCK — ${cast.join(" and ")} must match the reference image exactly, as if copying it: same head shape and size, same face, same eyes, same hair, same skin, same build and proportions,${outfit ? "" : " same clothing items in the same colours,"} same hands, and the same rendering style and level of realism as the reference. Never redesign, ${outfit ? "" : "restyle, "}re-proportion, re-age or re-colour them${outfit ? "" : ", and never swap an item for a similar one"}.${cast
-            .map((n) => (characterLook(n) ? ` ${n} is exactly: ${characterLook(n)}.` : ""))
-            .join("")}${outfit ? ` WARDROBE IN THIS SCENE: ${outfit.trim().replace(/\.$/, "")}. This replaces any clothing in the reference image or the description above, and stays identical for the whole scene.` : ""}`
-        : "";
-      // Omni burns its own subtitles into talking clips now and then, garbled ("thyel", "voch"), even when the prompt
-      // says "no captions" near the end (protein soda clip 1, 15 credits). Every video therefore opens AND closes on it,
-      // unless the scene really wants words in the picture. Captions are added afterwards by flow_captions.
-      const noText = scene.type !== "image" && !on_screen_text;
-      const textFirst = noText ? "NO SUBTITLES, NO CAPTIONS, NO TEXT OF ANY KIND ON SCREEN. " : "";
-      const textLast = noText
-        ? " NO TEXT ON SCREEN: never add subtitles, captions, titles, speech transcripts, words or letters anywhere in the picture, at any moment; any speech is heard only, never written."
-        : "";
-      const inherit = reference_previous
-        ? " Match the previous image exactly for the subject's appearance, colour palette, lighting and rendering style; this is the same scene a moment later."
-        : "";
-      const params = {
-        ...scene,
-        prompt: `${textFirst}${opening}${scene.prompt.trim().replace(/\.?$/, ".")}${phrase ? ` ${phrase}` : ""}${lock}${inherit}${acting}${textLast}`,
-        chain_from: chain_previous ? jobs[i - 1].id : undefined,
-        reference_from: reference_previous ? jobs[i - 1].id : undefined,
-        output_dir,
-        file_stem: `scene-${String(offset + i + 1 - reused).padStart(2, "0")}`,
-      };
-      // Local patch: the same image request again returns the earlier image instead of another tile in Flow. Scenes
-      // that reference the previous scene depend on it, so they are always generated.
-      const key = scene.type === "image" && !reference_previous ? imageKey(params) : undefined;
-      const earlier = key && !regenerate ? earlierImages(key) : undefined;
+    for (const [i, scene] of scenes.entries()) {
+      const { params, key } = buildParams(scene, { prevId: jobs[i - 1]?.id, output_dir, file_stem: `scene-${String(offset + i + 1 - reused).padStart(2, "0")}` });
+      const earlier = key && !scene.regenerate ? earlierImages(key) : undefined;
       if (earlier) {
         reused++;
         jobs.push(this.queue.addDone({ ...params, file_stem: basename(earlier[0]).replace(/\.[^.]+$/, "") }, earlier,
           "already in this project (same prompt, model, ratio and references): nothing sent to Flow. Pass regenerate: true for a new take."));
         continue;
       }
-      jobs.push(this.queue.add({ ...params, dedup_key: key }));
+      const job = this.queue.add({ ...params, dedup_key: key });
+      const g = gates[i];
+      if (g.ok && g.force) {
+        job.note = `force: ${g.force} (gerbang G1/G2 dilewati; anggaran tetap dicek)`;
+        try {
+          appendLog(output_dir, { t: new Date().toISOString(), job: job.id, shot: scene.shot, tier: scene.tier, force: g.force });
+        } catch (e) {
+          job.note += ` · log produksi gagal ditulis: ${(e as Error).message}`;
+        }
+      }
+      jobs.push(job);
     }
     return { output_dir, jobs: jobs.map(jobView) };
   }
@@ -770,7 +869,8 @@ export class LocalCore implements Core {
 
   async edit({ project, asset, prompt, download_quality }: Args<"edit">) {
     const output_dir = projectDir(project);
-    const job = this.queue.add({ prompt, type: "video", max_credits: 0, edit_asset: asset, download_quality, output_dir, file_stem: this.nextStem(output_dir, "edit") });
+    const estimate = estimateUnquoted(output_dir, "edit", asset);
+    const job = this.queue.add({ prompt, type: "video", max_credits: 0, edit_asset: asset, download_quality, output_dir, file_stem: this.nextStem(output_dir, "edit"), ...estimate });
     return { output_dir, jobs: [jobView(job)] };
   }
 
@@ -794,6 +894,7 @@ export class LocalCore implements Core {
       }
     }
     const output_dir = projectDir(project);
+    const estimate = estimateUnquoted(output_dir, "continue");
     const job = this.queue.add({
       prompt,
       type: "video",
@@ -805,6 +906,7 @@ export class LocalCore implements Core {
       download_quality,
       output_dir,
       file_stem: this.nextStem(output_dir, "shot"),
+      ...estimate,
     });
     return { output_dir, jobs: [jobView(job)] };
   }
@@ -942,4 +1044,115 @@ export async function captionsHere({ project, ...a }: Args<"captions">) {
 
 export async function captionSetupHere() {
   return captionSetup();
+}
+
+// Self-check: `node dist/core.js --cek`. Opt-in proof: for scenes without shot/force in a project without produksi.json,
+// buildParams() yields byte-for-byte the params generate() queued before production mode existed (golden captured from
+// commit ba9a06e by stubbing the queue; fixtures/params.golden.json).
+if (process.argv[1]?.endsWith("core.js") && process.argv.includes("--cek")) {
+  const { readFileSync } = await import("node:fs");
+  const assert = (c: unknown, m: string) => {
+    if (!c) throw new Error(`cek gagal: ${m}`);
+  };
+  const input = JSON.parse(readFileSync(new URL("../fixtures/params.contoh.json", import.meta.url), "utf8"));
+  const golden = JSON.parse(readFileSync(new URL("../fixtures/params.golden.json", import.meta.url), "utf8")) as string[];
+  const { scenes } = z.object(shapes.generate).parse(input);
+  const output_dir = "/tmp/flow-mcp-cek/kopi-pagi";
+  const got = scenes.map((s, i) => {
+    const { params, key } = buildParams(s, { prevId: i ? `job-${i}` : undefined, output_dir, file_stem: `scene-${String(i + 1).padStart(2, "0")}` });
+    return JSON.stringify({ ...params, dedup_key: key });
+  });
+  assert(got.length === golden.length, "jumlah scene");
+  got.forEach((g, i) => assert(g === golden[i], `scene ${i + 1}: params berbeda dari sebelum perubahan\n  kini: ${g}\n  dulu: ${golden[i]}`));
+  // shot/force hanya ikut bila diberikan; selebihnya params tetap sama.
+  const withShot = buildParams({ ...scenes[0], shot: "S01", force: "uji" }, { output_dir, file_stem: "scene-01" }).params;
+  const { shot, force, ...rest } = withShot;
+  assert(shot === "S01" && force === "uji", "shot/force dibawa ke job");
+  assert(JSON.stringify(rest) === JSON.stringify(buildParams(scenes[0], { output_dir, file_stem: "scene-01" }).params), "selain shot/force identik");
+
+  // generate()/edit()/continue_shot() end to end with the queue stubbed (nothing reaches Flow). OUTPUT_ROOT and
+  // FLOW_MCP_HOME are fixed at import, so this part runs in a child process pointed at a throwaway folder.
+  if (!process.env.FLOW_MCP_CEK_CHILD) {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { spawnSync } = await import("node:child_process");
+    const root = mkdtempSync(join(tmpdir(), "core-cek-"));
+    const r = spawnSync(process.execPath, [process.argv[1], "--cek"], {
+      stdio: "inherit",
+      env: { ...process.env, FLOW_MCP_CEK_CHILD: "1", FLOW_MCP_OUTPUT: join(root, "out"), FLOW_MCP_HOME: join(root, "home") },
+    });
+    const { rmSync } = await import("node:fs");
+    rmSync(root, { recursive: true, force: true });
+    if (r.status !== 0) process.exit(r.status ?? 1);
+    console.log("core ok");
+  } else {
+    const { mkdirSync: mkd, writeFileSync, readFileSync: rd } = await import("node:fs");
+    mkd(process.env.FLOW_MCP_HOME!, { recursive: true });
+    const { spentCredits, latestClip } = await import("./produksi.js");
+    const core = new LocalCore();
+    let added: SceneParams[] = [];
+    let n = 0;
+    (core as any).queue = {
+      add: (p: SceneParams) => (added.push(p), { id: `job-${++n}`, status: "queued", params: p, files: [], attempts: 0 }),
+      addDone: () => { throw new Error("addDone tak diharapkan"); },
+      list: () => [],
+    };
+    const gen = (sc: unknown[], project = "kopi-pagi") => core.generate(z.object(shapes.generate).parse({ project, scenes: sc }));
+    const dir = projectDir("kopi-pagi");
+    // 1. no produksi.json: generate() queues exactly the golden params
+    await gen(input.scenes);
+    const cur = added.map((p) => JSON.stringify(p).split(JSON.stringify(dir).slice(1, -1)).join(output_dir));
+    assert(cur.length === golden.length && cur.every((c, i) => c === golden[i]), "generate() tanpa produksi.json = params sebelum perubahan");
+    // edit/continue without produksi.json: no estimate key
+    added = [];
+    await core.edit({ project: "kopi-pagi", asset: "x", prompt: "make it rain", acknowledge_cost: true } as any);
+    assert(added.length === 1 && !("estimate" in added[0]), "edit tanpa produksi.json: params tanpa estimate");
+    // 2. production mode
+    mkd(dir, { recursive: true });
+    const prod = JSON.parse(rd(new URL("../fixtures/produksi.contoh.json", import.meta.url), "utf8"));
+    writeFileSync(join(dir, "produksi.json"), JSON.stringify(prod));
+    added = [];
+    let msg = "";
+    try { await gen([{ prompt: "a", tier: "draft" }, { prompt: "b", tier: "final" }]); } catch (e) { msg = (e as Error).message; }
+    assert(msg.includes("Scene 2") && msg.includes("wajib shot") && added.length === 0, "scene ditolak -> tak ada job sama sekali (gagal cepat)");
+    msg = "";
+    try { await gen([{ prompt: "a", tier: "final", shot: "S03" }]); } catch (e) { msg = (e as Error).message; }
+    assert(msg.includes("G2") && added.length === 0, "keyframe belum lulus -> ditolak");
+    await gen([{ prompt: "a", tier: "draft" }, { prompt: "b", type: "image" }]);
+    assert(added.length === 2 && !added.some((p) => "shot" in p || "force" in p), "draft & gambar lolos tanpa shot");
+    added = [];
+    const out = (await gen([{ prompt: "c", tier: "final", shot: "S01", force: "uji sudut" }])) as any;
+    assert(added[0].shot === "S01" && added[0].force === "uji sudut", "shot/force dibawa ke params job");
+    assert(out.jobs[0].note.includes("force: uji sudut"), "alasan force dikembalikan di catatan job");
+    assert(rd(join(dir, "produksi-log.jsonl"), "utf8").includes('"force":"uji sudut"'), "force dicatat di log");
+    assert(spentCredits(dir) === 0, "catatan force (tanpa file) tak menghabiskan anggaran");
+    // 3. logDone: one line per video, counted once per job; retry of the same job id is not double-counted
+    const job = { id: "jd1", status: "done", params: { ...added[0] }, files: [], attempts: 1, credits: 24, createdAt: "" } as Job;
+    logDone(job, [join(dir, "scene-07.mp4"), join(dir, "scene-07.jpeg")]);
+    logDone(job, [join(dir, "scene-07.mp4")]);
+    assert(spentCredits(dir) === 24 && latestClip(dir, "S01") === "scene-07.mp4", "log setelah done: 24 kredit, sekali per job");
+    // 4. no-quote tools: estimate against budget (48 - 24 = 24 left)
+    added = [];
+    msg = "";
+    try { await core.edit({ project: "kopi-pagi", asset: "kopi-pagi-scene-07", prompt: "rain", acknowledge_cost: true } as any); } catch (e) { msg = (e as Error).message; }
+    assert(msg.includes("Anggaran project habis") && msg.includes("sisa 24") && msg.includes("perkiraan 50") && added.length === 0, `edit melebihi sisa -> ditolak sebelum antre (${msg})`);
+    await core.continue_shot({ project: "kopi-pagi", from_asset: "kopi-pagi-scene-07", prompt: "he walks out", aspect_ratio: "9:16", mode: "exact", acknowledge_cost: true, force: true } as any);
+    assert(added.length === 1 && added[0].estimate === 24, "continue = 24 <= sisa 24 -> diantre dengan estimate");
+    const ej = { id: "je1", status: "done", params: added[0], files: [], attempts: 1, createdAt: "" } as Job;
+    logDone(ej, [join(dir, "shot-01.mp4")]);
+    assert(spentCredits(dir) === 48 && ej.note!.includes("saldo tak terbaca"), "saldo tak terbaca -> perkiraan dicatat");
+    const mj = { id: "je2", status: "done", params: { ...added[0] }, files: [], attempts: 1, credits: 30, createdAt: "" } as Job;
+    logDone(mj, [join(dir, "shot-02.mp4")]);
+    const last = JSON.parse(rd(join(dir, "produksi-log.jsonl"), "utf8").trim().split("\n").pop()!);
+    assert(last.estimate === true && last.quote === 24 && last.credits === 30 && mj.note!.includes("terukur dari saldo"), "biaya nyata dari saldo dicatat berlabel");
+    // 5. broken produksi.json: refused, file named, no job; another project is unaffected
+    writeFileSync(join(dir, "produksi.json"), "{ rusak");
+    added = [];
+    msg = "";
+    try { await gen([{ prompt: "a", type: "image" }]); } catch (e) { msg = (e as Error).message; }
+    assert(msg.includes(join(dir, "produksi.json")) && added.length === 0, "produksi.json rusak -> ditolak menyebut berkas");
+    await gen([{ prompt: "a", tier: "final" }], "proyek-lain");
+    assert(added.length === 1, "project lain tak terganggu");
+    console.log("core (anak) ok");
+  }
 }

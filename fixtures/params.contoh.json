@@ -1,0 +1,11 @@
+{
+  "project": "kopi-pagi",
+  "scenes": [
+    { "prompt": "A barista hands her a warm cup of coffee at the counter", "tier": "final", "angle": "low-angle", "technique": "dolly-in", "duration": 8, "first_frame": "/tmp/kopi-pagi/frame/s01-start.jpg", "last_frame": "/tmp/kopi-pagi/frame/s01-end.jpg" },
+    { "prompt": "Steam rises from the cup on the wooden table", "tier": "draft", "resolution": "720p", "duration": 6, "chain_previous": true },
+    { "prompt": "A sunrise over the quiet street outside the cafe", "type": "image", "aspect_ratio": "9:16" },
+    { "prompt": "The same street a moment later, a cyclist passes", "type": "image", "reference_previous": true },
+    { "prompt": "Kopi Tester Fiktif smiles and lifts the cup", "tier": "hero", "outfit": "a plain cream apron.", "reference_images": ["asset:Kopi Tester Fiktif"], "on_screen_text": true, "performance": false, "max_credits": 50 },
+    { "prompt": "Coffee beans pour into the grinder", "model": "Veo 3.1 - Fast", "technique": "orbit-arc", "variants": 2, "retries": 0, "download_quality": "upscaled" }
+  ]
+}

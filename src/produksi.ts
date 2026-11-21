@@ -85,7 +85,7 @@ export function loadProduction(projectDir: string): Production | undefined {
   const r = ProductionSchema.safeParse(raw);
   if (!r.success) {
     const i = r.error.issues[0];
-    throw new Error(`produksi.json: ${i.path.join(".") || "(akar)"}: ${i.message}`);
+    throw new Error(`produksi.json: ${i.path.join(".") || "(akar)"}: ${i.message} (berkas: ${f})`);
   }
   return r.data;
 }
@@ -242,6 +242,71 @@ export function latestClip(projectDir: string, shot: string): string | undefined
   const l = readLog(projectDir).filter((e) => e.shot === shot && e.file);
   return l.length ? l[l.length - 1].file : undefined;
 }
+
+// ---- Gerbang G1-G3 (tahap 1). Hanya aktif bila project punya produksi.json. ----
+
+export type GateScene = { shot?: string; force?: string; tier?: string; type: string; model?: string };
+export type GateResult = { ok: true; force?: string } | { ok: false; reason: string };
+
+/** Video berbayar = video selain tier draft (tanpa tier = model Flow saat ini, dianggap berbayar). */
+export const paidVideo = (s: { type: string; tier?: string }) => s.type === "video" && s.tier !== "draft";
+
+/**
+ * G1 (lint shot bersih) + G2 (keyframe lulus di qa.json) untuk satu scene, sebelum job dibuat.
+ * Tanpa produksi.json -> selalu ok (opt-in). produksi.json/qa.json rusak -> semua job project itu ditolak.
+ * `force` (alasan tak kosong) melewati G1/G2 saja; G3 (anggaran) dicek terpisah saat quote dan tak bisa di-force.
+ */
+export function gate(projectDir: string, scene: GateScene): GateResult {
+  let p: Production | undefined;
+  try {
+    p = loadProduction(projectDir);
+  } catch (e) {
+    return { ok: false, reason: `${(e as Error).message}. Perbaiki berkas itu dulu; tidak ada job yang dibuat.` };
+  }
+  if (!p || !paidVideo(scene)) return { ok: true };
+  const force = scene.force?.trim();
+  if (force) return { ok: true, force };
+  if (!scene.shot) return { ok: false, reason: "Mode produksi: video berbayar wajib shot (mis. shot: \"S01\"), atau tier: \"draft\" (gratis), atau force: \"<alasan>\"." };
+  const id = scene.shot;
+  if (!p.shots.some((s) => s.id === id)) return { ok: false, reason: `Mode produksi: shot '${id}' tidak ada di produksi.json.` };
+  const errors = lint(p, (f) => existsSync(f), projectDir).filter((i) => i.level === "error" && (i.shot === id || !i.shot));
+  if (errors.length) {
+    return { ok: false, reason: `G1 ${id}: error lint ${errors.map((i) => `${i.code} (${i.message})`).join("; ")}. Perbaiki produksi.json, atau force: "<alasan>".` };
+  }
+  let qa: Qa;
+  try {
+    qa = readQa(projectDir);
+  } catch (e) {
+    return { ok: false, reason: (e as Error).message };
+  }
+  if (qa[id]?.keyframes?.passed !== true) {
+    return { ok: false, reason: `G2 ${id}: pasangan keyframe START/END belum lulus di qa.json. Jalankan cek pasangan dulu, atau force: "<alasan>".` };
+  }
+  return { ok: true };
+}
+
+/** Sisa anggaran kredit; undefined = bukan mode produksi. budget_credits kosong dihitung 0. Berkas rusak -> melempar. */
+export function budgetLeft(projectDir: string): number | undefined {
+  const p = loadProduction(projectDir);
+  if (!p) return undefined;
+  return (p.budget_credits ?? 0) - spentCredits(projectDir);
+}
+
+/** G3: quote 0 (draft) tak pernah ditolak. */
+export const overBudget = (left: number, quote: number): boolean => quote > 0 && quote > left;
+
+export const budgetMessage = (left: number, quote: number, what = "quote") =>
+  `Anggaran project habis: sisa ${left}, ${what} ${quote}. Naikkan budget_credits di produksi.json setelah user setuju.`;
+
+// Alat berbayar tanpa quote Flow: perkiraan konservatif sebelum jalan.
+export const EDIT_CREDITS_PER_S = 5; // diukur: klip 4 dtk = 20 kredit
+export const EDIT_MAX_SECONDS = 10; // klip Flow terpanjang (Omni 10 dtk)
+export const EXTEND_CREDITS = 24; // harga klip Omni 1.2 Flash, 8 dtk
+export function estimateCost(kind: "edit" | "continue", seconds?: number): number {
+  if (kind === "continue") return EXTEND_CREDITS;
+  return EDIT_CREDITS_PER_S * Math.ceil(seconds && seconds > 0 ? seconds : EDIT_MAX_SECONDS);
+}
+export const MEASURED_NOTE = "biaya terukur dari saldo, bisa termasuk pemakaian tim";
 
 const cell = (v: unknown) => String(v ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
 
@@ -429,5 +494,59 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   writeFileSync(join(cd, "produksi.json"), "{ rusak");
   const bad2 = checkReport(cd, "json") as any;
   assert(typeof bad2.error === "string" && bad2.error.includes("produksi.json") && bad2.error.includes(cd), "rusak -> error menyebut berkas");
+  // Gerbang G1/G2 + anggaran G3 (tahap 1, task 4)
+  const gd = mkd2(join(tmpdir(), "produksi-gate-"));
+  const fin = { type: "video", tier: "final" };
+  assert(gate(gd, { ...fin }).ok === true, "tanpa produksi.json -> gate ok");
+  assert(gate(gd, { ...fin, shot: "S01" }).ok === true, "tanpa produksi.json -> shot diabaikan, ok");
+  assert(budgetLeft(gd) === undefined, "tanpa produksi.json -> budgetLeft undefined");
+  writeFileSync(join(gd, "produksi.json"), JSON.stringify(raw));
+  const why = (r: ReturnType<typeof gate>) => (r.ok ? "" : r.reason);
+  assert(why(gate(gd, { ...fin })).includes("wajib shot"), "video final tanpa shot -> wajib shot");
+  assert(why(gate(gd, { type: "video" })).includes("wajib shot"), "video tanpa tier (model Flow saat ini) juga berbayar");
+  assert(why(gate(gd, { ...fin, shot: "S09" })).includes("S09"), "shot tak dikenal ditolak");
+  writeFileSync(join(gd, "produksi.json"), JSON.stringify({ ...raw, shots: raw.shots.map((x: any) => (x.id === "S01" ? { ...x, angle: "low-angel" } : x)) }));
+  const g1 = why(gate(gd, { ...fin, shot: "S01" }));
+  assert(g1.includes("E_ID") && g1.includes("G1"), `shot ber-error lint -> ditolak menyebut kode (${g1})`);
+  assert(gate(gd, { ...fin, shot: "S03" }).ok === false && why(gate(gd, { ...fin, shot: "S03" })).includes("G2"), "error lint shot lain tak memblokir G1 S03, tapi keyframe S03 belum lulus -> G2");
+  const forced = gate(gd, { ...fin, shot: "S01", force: "uji" });
+  assert(forced.ok === true && forced.force === "uji", "force melewati G1/G2 dan alasan dikembalikan");
+  assert(gate(gd, { ...fin, shot: "S01", force: "  " }).ok === false, "force kosong bukan force");
+  writeFileSync(join(gd, "produksi.json"), JSON.stringify(raw));
+  const g2 = why(gate(gd, { ...fin, shot: "S03" }));
+  assert(g2.includes("keyframe") && g2.includes("S03"), `keyframe belum lulus -> ditolak (${g2})`);
+  mergeQa(gd, "S03", { keyframes: { passed: false, by: "t", at: "x" } });
+  assert(gate(gd, { ...fin, shot: "S03" }).ok === false, "keyframe passed:false -> ditolak");
+  mergeQa(gd, "S03", { keyframes: { passed: true, by: "t", at: "x" } });
+  const ok3 = gate(gd, { ...fin, shot: "S03" });
+  assert(ok3.ok === true && ok3.force === undefined, "S03 lint bersih + keyframe lulus -> ok");
+  assert(gate(gd, { type: "video", tier: "draft" }).ok === true, "draft bebas gerbang (tanpa shot/keyframe)");
+  assert(gate(gd, { type: "image" }).ok === true, "gambar bebas gerbang");
+  // anggaran: budget 48, terpakai 24, quote 30 -> sisa 24 -> tolak
+  assert(budgetLeft(gd) === 48, "budget penuh tanpa log");
+  appendLog(gd, { t: "1", job: "j1", shot: "S03", file: "s3.mp4", quote: 24, credits: 24 });
+  assert(budgetLeft(gd) === 24, "budgetLeft = 48 - 24");
+  assert(overBudget(24, 30) === true, "quote 30 > sisa 24 -> tolak");
+  assert(overBudget(24, 24) === false, "quote = sisa -> boleh");
+  assert(overBudget(-5, 0) === false, "quote 0 (draft) tak pernah ditolak");
+  writeFileSync(join(gd, "produksi.json"), JSON.stringify({ ...raw, budget_credits: undefined }));
+  assert(budgetLeft(gd) === -24, "budget belum diisi -> sisa 0 - terpakai (tak bisa di-force)");
+  // produksi.json rusak -> semua job project itu ditolak dengan pesan berkas + jalur
+  writeFileSync(join(gd, "produksi.json"), "{ rusak");
+  for (const sc of [{ ...fin, shot: "S03", force: "x" }, { type: "image" }, { type: "video", tier: "draft" }]) {
+    const r = why(gate(sc.type === "image" ? gd : gd, sc));
+    assert(r.includes("produksi.json") && r.includes(gd), `rusak -> ditolak menyebut berkas+jalur (${JSON.stringify(sc)})`);
+  }
+  writeFileSync(join(gd, "produksi.json"), JSON.stringify({ ...raw, stage: "ngawur" }));
+  const r2 = why(gate(gd, { type: "image" }));
+  assert(r2.includes("stage") && r2.includes(join(gd, "produksi.json")), `skema salah -> jalur zod + berkas (${r2})`);
+  let threw = "";
+  try { budgetLeft(gd); } catch (e) { threw = (e as Error).message; }
+  assert(threw.includes(join(gd, "produksi.json")), "budgetLeft pada berkas rusak melempar dengan jalur");
+  // alat tanpa quote
+  assert(estimateCost("continue") === 24, "Extend/continue = harga klip Omni 1.2 (24)");
+  assert(estimateCost("edit") === 50, "edit tanpa durasi diketahui = 5 x 10 dtk (terpanjang)");
+  assert(estimateCost("edit", 4) === 20, "edit 4 dtk = 20");
+  assert(estimateCost("edit", 4.2) === 25, "durasi dibulatkan ke atas");
   console.log("produksi ok");
 }

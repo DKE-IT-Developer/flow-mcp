@@ -7,6 +7,7 @@ import type { Job } from "./queue.js";
 import { extractZip } from "./platform.js";
 import { forgetUpload, knownAssetNames, rememberUpload } from "./dedup.js";
 import { motionCheck } from "./motion.js";
+import { budgetLeft, budgetMessage, overBudget } from "./produksi.js";
 
 export interface FlowState {
   url: string;
@@ -875,6 +876,12 @@ export async function runGeneration(job: Job): Promise<string[]> {
     throw new Error(
       `Flow quotes ${job.credits} credits for this scene, above max_credits=${s.max_credits}. Nothing was generated. Raise max_credits or pick a cheaper model/duration/variants.`,
     );
+  }
+  // G3, production mode only (produksi.json in the project folder): credits already logged + this quote must fit
+  // budget_credits. Not forceable; budgetLeft is undefined for every other project, so nothing changes there.
+  if (s.type === "video") {
+    const left = budgetLeft(s.output_dir);
+    if (left !== undefined && overBudget(left, job.credits)) throw new Error(`${budgetMessage(left, job.credits)} Nothing was generated.`);
   }
 
   if (s.first_frame) {
