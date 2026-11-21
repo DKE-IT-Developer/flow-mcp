@@ -41,6 +41,7 @@ export interface SceneParams {
   // output_dir is the project folder, so the owner process finds produksi.json and the credit log from there.
   shot?: string;
   force?: string;
+  tier?: "draft" | "final" | "hero";
   // Production mode, tools without a Flow quote (edit, continue): the conservative credit estimate checked against the budget.
   estimate?: number;
   // Production mode: centre (0..1) of a crop:<factor> frame reference.

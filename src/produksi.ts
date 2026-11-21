@@ -429,7 +429,9 @@ function faceRefs(projectDir: string, p: Production, shot?: string): string[] {
   return s.cast.map((c) => p.cast[c]?.face_refs[s.expression!]).filter((r): r is string => !!r).map((r) => resolvePrivate(projectDir, r));
 }
 
-export type FrameOpts = { target?: string; role?: "start" | "end"; source?: string; center?: [number, number] };
+// strict: pasangan turunan -> ref wajah HANYA dari shot tujuan (tanpa cadangan shot sumber); tanpa ref = melempar.
+// tag: id job, masuk nama berkas agar job yang berjalan bersamaan tidak saling menimpa.
+export type FrameOpts = { target?: string; role?: "start" | "end"; source?: string; center?: [number, number]; strict?: boolean; tag?: string };
 
 /**
  * `shot:S02@4.2` -> frame dari klip S02 (chosen / terbaru) dalam 4,2 ± 0,5 dtk (tanpa @: 0,5 dtk terakhir) dengan skor
@@ -450,7 +452,8 @@ export async function resolveFrameRef(projectDir: string, ref: string, at?: numb
     const w = Math.round(W / r.factor), h = Math.round(H / r.factor);
     const clamp = (v: number, hi: number) => Math.min(Math.max(v, 0), hi);
     const x = clamp(Math.round(cx * W - w / 2), W - w), y = clamp(Math.round(cy * H - h / 2), H - h);
-    const out = join(outDir, `${basename(src).replace(/\.[^.]+$/, "")}-crop-${r.factor.toFixed(2)}.png`);
+    const stem = basename(src).replace(/\.[^.]+$/, "");
+    const out = join(outDir, `${stem}-crop-${r.factor.toFixed(2)}${opts.tag && !stem.endsWith(`-${opts.tag}`) ? `-${opts.tag}` : ""}.png`);
     await ffmpeg(["-i", src, "-vf", `crop=${w}:${h}:${x}:${y},scale=${W}:${H}:flags=lanczos`, "-frames:v", "1", out]);
     return { path: out };
   }
@@ -469,7 +472,8 @@ export async function resolveFrameRef(projectDir: string, ref: string, at?: numb
       .map((f, i) => ({ file: join(tmp, f), t: Math.round((lo + i / FRAME_FPS) * 100) / 100 }));
     if (!cands.length) throw new Error(`${ref}: tak ada frame di ${lo.toFixed(2)}–${hi.toFixed(2)} dtk klip ${r.shot}`);
     const target = opts.target ?? r.shot;
-    const refs = faceRefs(projectDir, p, target).length ? faceRefs(projectDir, p, target) : faceRefs(projectDir, p, r.shot);
+    const refs = faceRefs(projectDir, p, target).length || opts.strict ? faceRefs(projectDir, p, target) : faceRefs(projectDir, p, r.shot);
+    if (opts.strict && !refs.length) throw new Error(`${ref}: pasangan turunan butuh face_refs[expression] pemeran shot tujuan ${target}; isi produksi.json, atau force: "<alasan>"`);
     let best: { file: string; t: number; face?: number } | undefined;
     if (!refs.length) {
       best = cands.reduce((a, b) => (Math.abs(b.t - center) < Math.abs(a.t - center) ? b : a));
@@ -485,7 +489,7 @@ export async function resolveFrameRef(projectDir: string, ref: string, at?: numb
         throw new Error(`${ref}: tak ada frame dengan wajah ≥ ${FACE_PASS.toFixed(2)} dalam ${lo.toFixed(2)}–${hi.toFixed(2)} dtk (${why}). Ganti sambungan ke cut-on-action dengan START baru.`);
       }
     }
-    const name = `${opts.target ?? r.shot}-${opts.role ?? "frame"}-${r.shot}-${best.t.toFixed(2)}s.jpg`;
+    const name = `${opts.target ?? r.shot}-${opts.role ?? "frame"}-${r.shot}-${best.t.toFixed(2)}s${opts.tag ? `-${opts.tag}` : ""}.jpg`;
     const out = join(outDir, name);
     copyFileSync(best.file, out);
     return { path: out, face: best.face, at: best.t };
@@ -499,25 +503,40 @@ export async function resolveFrameRef(projectDir: string, ref: string, at?: numb
  * frame/turunan/. Sisi sumber dulu, lalu crop dari hasilnya. START shot: (wajah ≥ 0,80) + END crop (atau kebalikannya)
  * -> keyframes shot tujuan dicatat lulus di qa.json (by "turunan"). Gagal -> melempar (job gagal sebelum Flow dibuka).
  */
-export async function resolveSceneFrames(projectDir: string, scene: FrameScene): Promise<string[]> {
+export async function resolveSceneFrames(projectDir: string, scene: FrameScene, opts: { exempt?: boolean; tag?: string } = {}): Promise<string[]> {
   if (!isDerivedRef(scene.first_frame) && !isDerivedRef(scene.last_frame)) return [];
   checkFrameRefs(projectDir, scene);
+  const p = needProduction(projectDir);
   const pair = derivedPair(scene);
+  // Pasangan turunan pada job bergerbang (bukan force/draft): lulusnya hanya dari wajah pemeran shot TUJUAN.
+  const strict = pair && !opts.exempt;
+  if (strict && !(scene.shot && p.shots.some((s) => s.id === scene.shot)))
+    throw new Error(`pasangan turunan butuh shot tujuan yang ada di produksi.json (shot: ${scene.shot ?? "kosong"})`);
+  if (strict && !faceRefs(projectDir, p, scene.shot).length)
+    throw new Error(`pasangan turunan butuh face_refs[expression] pemeran shot tujuan ${scene.shot}; isi produksi.json, atau force: "<alasan>"`);
   const notes: string[] = [];
   let face: number | undefined;
+  // Hasil dikumpulkan dulu; scene baru diubah setelah KEDUA sisi selesai, agar kegagalan tak meninggalkan setengah
+  // rujukan terselesaikan yang pada retry melewati cek wajah.
+  const resolved: { first_frame?: string; last_frame?: string } = {};
   const sides = [["first_frame", "start"], ["last_frame", "end"]] as const;
   for (const crop of [false, true]) {
     for (const [key, role] of sides) {
       const ref = scene[key];
       if (!ref || isCropRef(ref) !== crop || !isDerivedRef(ref)) continue;
-      const other = scene[key === "first_frame" ? "last_frame" : "first_frame"];
-      const r = await resolveFrameRef(projectDir, ref, key === "first_frame" ? scene.first_frame_at : undefined, { target: scene.shot, role, source: other, center: scene.crop_center });
-      scene[key] = r.path;
+      const otherKey = key === "first_frame" ? "last_frame" : "first_frame";
+      const other = resolved[otherKey] ?? scene[otherKey];
+      const r = await resolveFrameRef(projectDir, ref, key === "first_frame" ? scene.first_frame_at : undefined, {
+        target: scene.shot, role, source: other, center: scene.crop_center, strict: strict && isShotRef(ref), tag: opts.tag,
+      });
+      resolved[key] = r.path;
       if (r.face !== undefined) face = r.face;
       notes.push(`frame turunan ${role.toUpperCase()}: ${ref} -> ${basename(r.path)}${r.at !== undefined ? ` (${r.at.toFixed(2)} dtk)` : ""}${r.face !== undefined ? `, wajah ${r.face.toFixed(2)}` : ""}`);
     }
   }
-  const p = needProduction(projectDir);
+  if (strict && face === undefined) throw new Error(`pasangan turunan ${scene.shot}: skor wajah tidak ada; jalankan cek pasangan, atau force: "<alasan>"`);
+  if (resolved.first_frame) scene.first_frame = resolved.first_frame;
+  if (resolved.last_frame) scene.last_frame = resolved.last_frame;
   if (pair && face !== undefined && scene.shot && p.shots.some((s) => s.id === scene.shot)) {
     mergeQa(projectDir, scene.shot, { keyframes: { passed: true, face, by: "turunan", at: new Date().toISOString() } });
     notes.push(`pasangan turunan ${scene.shot} dicatat lulus di qa.json`);
@@ -842,7 +861,8 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
     // satu scene: START dari shot, END crop -> pasangan turunan lulus otomatis
     const sp: { first_frame?: string; last_frame?: string; shot?: string; crop_center?: [number, number] } = { first_frame: "shot:S01@1.0", last_frame: "crop:1.10", shot: "S02" };
     checkFrameRefs(fd, sp);
-    const notes = await resolveSceneFrames(fd, sp);
+    const notes = await resolveSceneFrames(fd, sp, { tag: "jobA" });
+    assert(basename(sp.first_frame!).includes("-jobA") && basename(sp.last_frame!).includes("-jobA"), `nama berkas turunan memuat id job (${sp.first_frame}, ${sp.last_frame})`);
     assert(existsSync(sp.first_frame!) && existsSync(sp.last_frame!) && sp.last_frame!.endsWith(".png"), "kedua frame jadi berkas lokal");
     assert(seenRefs[0] === join(fd, "talent/ekspresi/senyum.png"), "ref wajah dari shot TUJUAN (S02 smile)");
     const kq = readQa(fd).S02?.keyframes;
@@ -857,6 +877,19 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
     const pb: { first_frame?: string; last_frame?: string; shot?: string } = { first_frame: "crop:1.2", last_frame: "shot:S01", shot: "S02" };
     await resolveSceneFrames(fd, pb);
     assert(pb.first_frame!.endsWith(".png") && dims(pb.first_frame!) === "320x240", "pull-back: START = crop dari END");
+    // tanpa face_refs di shot TUJUAN: pasangan turunan melempar (tanpa cadangan ref shot sumber), scene tak diubah sebagian
+    writeFileSync(join(fd, "produksi.json"), JSON.stringify({ ...raw, shots: raw.shots.map((x: any) => (x.id === "S02" ? { ...x, expression: undefined } : x)) }));
+    const np: { first_frame?: string; last_frame?: string; shot?: string } = { first_frame: "shot:S01@1.0", last_frame: "crop:1.10", shot: "S02" };
+    const e7 = await errOf(() => resolveSceneFrames(fd, np));
+    assert(e7.includes("face_refs") && np.first_frame === "shot:S01@1.0" && np.last_frame === "crop:1.10", `tujuan tanpa face_refs -> gagal, scene utuh (${e7})`);
+    const npx = { ...np };
+    await resolveSceneFrames(fd, npx, { exempt: true });
+    assert(existsSync(npx.first_frame!), "force/draft (exempt): frame tetap diselesaikan tanpa lulus");
+    writeFileSync(join(fd, "produksi.json"), JSON.stringify(raw));
+    // sisi pertama selesai, sisi kedua gagal (di luar durasi) -> sisi pertama juga tidak diubah
+    const half: { first_frame?: string; last_frame?: string; shot?: string } = { first_frame: "shot:S01@1.0", last_frame: "shot:S01@9", shot: "S02" };
+    const e8 = await errOf(() => resolveSceneFrames(fd, half));
+    assert(e8.includes("durasi") && half.first_frame === "shot:S01@1.0", `kegagalan satu sisi tak meninggalkan mutasi sebagian (${e8})`);
     // validasi
     assert((await errOf(() => checkFrameRefs(fd, { first_frame: "crop:1.1", last_frame: "crop:1.2" }))).includes("crop"), "dua crop ditolak");
     assert((await errOf(() => checkFrameRefs(fd, { last_frame: "crop:1.1" }))).includes("crop"), "crop tanpa frame lawan ditolak");

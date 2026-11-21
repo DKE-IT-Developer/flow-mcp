@@ -10,7 +10,7 @@ import { KOKORO_DEFAULT_VOICE, KOKORO_MB, KOKORO_VOICES, kokoroReady, speakWithK
 import { extractFirstFrame, extractFrameAt, extractLastFrame } from "./chain.js";
 import { burnCaptions, captionedName, captionSetup, previewCaptions, transcribe } from "./captions.js";
 import { presenter } from "./presenter.js";
-import { appendLog, budgetLeft, budgetMessage, checkFrameRefs, checkReport, estimateCost, gate, isDerivedRef, loadProduction, MEASURED_NOTE, overBudget, resolveSceneFrames } from "./produksi.js";
+import { appendLog, budgetLeft, budgetMessage, checkFrameRefs, checkReport, estimateCost, gate, isDerivedRef, loadProduction, MEASURED_NOTE, overBudget, paidVideo, resolveSceneFrames } from "./produksi.js";
 import { characterLook, createCharacter, createProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
 import { JobQueue, type Job, type SceneParams } from "./queue.js";
 import { earlierImages, imageKey, rememberImages } from "./dedup.js";
@@ -578,7 +578,8 @@ export function buildParams(
     output_dir: ctx.output_dir,
     file_stem: ctx.file_stem,
     // Production mode only: carried to the job (credit log). Elsewhere they are dropped, so params stay as before.
-    ...(ctx.production && shot ? { shot } : {}),
+    // tier rides along with shot so the worker can re-run the gates (draft = free) after resolving shot:/crop: frames.
+    ...(ctx.production && shot ? { shot, ...(tier ? { tier } : {}) } : {}),
     ...(ctx.production && force ? { force } : {}),
     ...(ctx.production && crop_center ? { crop_center } : {}),
   };
@@ -647,6 +648,9 @@ export function logDone(job: Job, files: string[]): string[] {
   return files;
 }
 
+// Indirection so the self-check can stub the Flow run and prove a refused job never reaches it.
+export const runners = { generation: runGeneration };
+
 export class LocalCore implements Core {
   private queue: JobQueue = new JobQueue(async (job) => {
     const { chain_from, reference_from } = job.params;
@@ -672,8 +676,13 @@ export class LocalCore implements Core {
     // Production mode: shot:/crop: frame references become files in frame/turunan/ right before the job runs (the
     // parent clip may have been chosen after queueing). A face below 0.80 fails the job here, before Flow is opened.
     if (isDerivedRef(job.params.first_frame) || isDerivedRef(job.params.last_frame)) {
-      const notes = await resolveSceneFrames(job.params.output_dir, job.params);
+      const p = job.params;
+      const notes = await resolveSceneFrames(p.output_dir, p, { exempt: !!p.force?.trim() || !paidVideo(p), tag: job.id });
       job.note = [job.note, ...notes].filter(Boolean).join(" · ");
+      // G2 was deferred at queue time for a derived pair: re-run the gates now that the frames are files, so a pair
+      // whose face check did not record a pass (produksi.json edited meanwhile, say) fails here, before Flow and credits.
+      const g = gate(p.output_dir, p);
+      if (!g.ok) throw new Error(`Gerbang saat job jalan: ${g.reason}`);
     }
     // Production mode: tools without a Flow quote are re-checked against the budget right before they run, because
     // jobs ahead of them in the queue may have spent it since they were queued.
@@ -684,7 +693,7 @@ export class LocalCore implements Core {
     if (job.params.continue_from) return logDone(job, await runContinue(job));
     if (job.params.agent_scenes) return runAgentBatch(job);
     if (job.params.edit_asset) return logDone(job, await runEdit(job));
-    const files = await runGeneration(job);
+    const files = await runners.generation(job);
     if (job.params.dedup_key && files.length) rememberImages(job.params.dedup_key, files);
     return logDone(job, files);
   });
@@ -1094,8 +1103,8 @@ if (process.argv[1]?.endsWith("core.js") && process.argv.includes("--cek")) {
   const passed = buildParams({ ...scenes[0], shot: "S01", force: "uji" }, { output_dir, file_stem: "scene-01" });
   assert(JSON.stringify({ ...passed.params, dedup_key: passed.key }) === golden[0], "di luar mode produksi shot/force tak masuk params (golden tetap)");
   const withShot = buildParams({ ...scenes[0], shot: "S01", force: "uji" }, { output_dir, file_stem: "scene-01", production: true }).params;
-  const { shot, force, ...rest } = withShot;
-  assert(shot === "S01" && force === "uji", "shot/force dibawa ke job");
+  const { shot, force, tier: wTier, ...rest } = withShot;
+  assert(shot === "S01" && force === "uji" && wTier === scenes[0].tier, "shot/force/tier dibawa ke job");
   assert(JSON.stringify(rest) === JSON.stringify(buildParams(scenes[0], { output_dir, file_stem: "scene-01" }).params), "selain shot/force identik");
 
   // generate()/edit()/continue_shot() end to end with the queue stubbed (nothing reaches Flow). OUTPUT_ROOT and
@@ -1114,7 +1123,7 @@ if (process.argv[1]?.endsWith("core.js") && process.argv.includes("--cek")) {
     if (r.status !== 0) process.exit(r.status ?? 1);
     console.log("core ok");
   } else {
-    const { mkdirSync: mkd, writeFileSync, readFileSync: rd } = await import("node:fs");
+    const { mkdirSync: mkd, writeFileSync, readFileSync: rd, rmSync } = await import("node:fs");
     mkd(process.env.FLOW_MCP_HOME!, { recursive: true });
     const { spentCredits, latestClip } = await import("./produksi.js");
     const core = new LocalCore();
@@ -1202,6 +1211,35 @@ if (process.argv[1]?.endsWith("core.js") && process.argv.includes("--cek")) {
     writeFileSync(join(dir, "scene-07.mp4"), "");
     await gen([{ prompt: "d", tier: "final", shot: "S02", first_frame: "shot:S01@4.2", last_frame: "crop:1.10", crop_center: [0.4, 0.3] }]);
     assert(added.length === 1 && added[0].first_frame === "shot:S01@4.2" && JSON.stringify(added[0].crop_center) === "[0.4,0.3]", "pasangan turunan: G2 ditunda, rujukan + crop_center dibawa ke job");
+    // produksi.json edited between queueing and running (target shot loses its face refs) -> job fails at run time,
+    // before Flow: the real worker runs with runGeneration stubbed.
+    const queued = added[0];
+    const realQueue = new LocalCore() as any;
+    const runner = realQueue.queue.runner as (j: Job) => Promise<string[]>;
+    let flowCalls = 0;
+    const realGen = runners.generation;
+    runners.generation = async () => { flowCalls++; return []; };
+    writeFileSync(join(dir, "produksi.json"), JSON.stringify({ ...prod, shots: prod.shots.map((x: any) => (x.id === "S02" ? { ...x, expression: undefined } : x)) }));
+    msg = "";
+    try { await runner({ id: "jr1", status: "running", params: { ...queued }, files: [], attempts: 1, createdAt: "" } as Job); } catch (e) { msg = (e as Error).message; }
+    assert(msg.includes("face_refs") && flowCalls === 0, `face_refs dihapus setelah antre -> job gagal sebelum Flow (${msg}, flow ${flowCalls}x)`);
+    // real clip + passing face (stubbed scorer): a lint error introduced after queueing is caught by the re-run gate;
+    // with a clean produksi.json the same job reaches the (stubbed) Flow run exactly once.
+    const { execFileSync } = await import("node:child_process");
+    const { setFaceScorer } = await import("./produksi.js");
+    execFileSync("nice", ["-n", "10", process.env.FLOW_MCP_FFMPEG ?? "ffmpeg", "-v", "error", "-y", "-threads", "4", "-f", "lavfi", "-i", "testsrc=duration=6:size=320x240:rate=24", "-pix_fmt", "yuv420p", join(dir, "scene-07.mp4")]);
+    setFaceScorer(async () => 0.9);
+    writeFileSync(join(dir, "produksi.json"), JSON.stringify({ ...prod, shots: prod.shots.map((x: any) => (x.id === "S02" ? { ...x, angle: "low-angel" } : x)) }));
+    msg = "";
+    try { await runner({ id: "jr2", status: "running", params: { ...queued }, files: [], attempts: 1, createdAt: "" } as Job); } catch (e) { msg = (e as Error).message; }
+    assert(msg.includes("Gerbang saat job jalan") && msg.includes("G1") && flowCalls === 0, `gerbang diulang saat jalan menolak (${msg})`);
+    writeFileSync(join(dir, "produksi.json"), JSON.stringify(prod));
+    rmSync(join(dir, "qa.json"), { force: true });
+    const okJob = { id: "jr3", status: "running", params: { ...queued }, files: [], attempts: 1, createdAt: "" } as Job;
+    await runner(okJob);
+    assert(flowCalls === 1 && okJob.params.first_frame!.includes("frame/turunan") && okJob.params.first_frame!.includes("-jr3"), `pasangan lulus -> Flow dipanggil sekali dengan frame turunan (${okJob.params.first_frame})`);
+    setFaceScorer(undefined);
+    runners.generation = realGen;
     added = [];
     msg = "";
     try { await gen([{ prompt: "d", tier: "final" }], "proyek-lain-2").then(() => gen([{ prompt: "e", first_frame: "shot:S01@1" }], "proyek-lain-2")); } catch (e) { msg = (e as Error).message; }
