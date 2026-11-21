@@ -537,7 +537,9 @@ export async function resolveSceneFrames(projectDir: string, scene: FrameScene, 
   if (strict && face === undefined) throw new Error(`pasangan turunan ${scene.shot}: skor wajah tidak ada; jalankan cek pasangan, atau force: "<alasan>"`);
   if (resolved.first_frame) scene.first_frame = resolved.first_frame;
   if (resolved.last_frame) scene.last_frame = resolved.last_frame;
-  if (pair && face !== undefined && scene.shot && p.shots.some((s) => s.id === scene.shot)) {
+  // Hanya job bergerbang (strict) yang menulis catatan lulus; force/draft (exempt) tidak pernah, karena wajahnya bisa
+  // dari ref shot sumber dan catatan itu akan meloloskan job berbayar berikutnya di gate().
+  if (strict && face !== undefined && scene.shot && p.shots.some((s) => s.id === scene.shot)) {
     mergeQa(projectDir, scene.shot, { keyframes: { passed: true, face, by: "turunan", at: new Date().toISOString() } });
     notes.push(`pasangan turunan ${scene.shot} dicatat lulus di qa.json`);
   }
@@ -885,6 +887,15 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
     const npx = { ...np };
     await resolveSceneFrames(fd, npx, { exempt: true });
     assert(existsSync(npx.first_frame!), "force/draft (exempt): frame tetap diselesaikan tanpa lulus");
+    // exempt dengan wajah dari ref shot sumber: TIDAK menulis lulus untuk shot tujuan
+    rmSync(join(fd, "qa.json"), { force: true });
+    const ex2 = { ...np };
+    await resolveSceneFrames(fd, ex2, { exempt: true });
+    assert(readQa(fd).S02?.keyframes?.passed !== true, `exempt -> qa.json tanpa keyframes.passed untuk S02 (${JSON.stringify(readQa(fd).S02)})`);
+    writeFileSync(join(fd, "produksi.json"), JSON.stringify(raw));
+    const ex3 = { first_frame: "shot:S01@1.0", last_frame: "crop:1.10", shot: "S02" };
+    await resolveSceneFrames(fd, ex3, { exempt: true });
+    assert(readQa(fd).S02?.keyframes?.passed !== true, "exempt dengan ref tujuan pun tak menulis lulus");
     writeFileSync(join(fd, "produksi.json"), JSON.stringify(raw));
     // sisi pertama selesai, sisi kedua gagal (di luar durasi) -> sisi pertama juga tidak diubah
     const half: { first_frame?: string; last_frame?: string; shot?: string } = { first_frame: "shot:S01@1.0", last_frame: "shot:S01@9", shot: "S02" };
@@ -901,7 +912,7 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
     assert(e6.includes("produksi.json"), `tanpa produksi.json -> shot:/crop: ditolak jelas (${e6})`);
     checkFrameRefs(nd, { first_frame: "/a/b.mp4", last_frame: "/c.png" });
     // gerbang: pasangan turunan (shot: + crop:) menunda G2 ke saat job jalan; frame biasa tetap G2
-    rmSync(join(fd, "qa.json"));
+    rmSync(join(fd, "qa.json"), { force: true });
     const gt = gate(fd, { type: "video", tier: "final", shot: "S02", first_frame: "shot:S01@1.0", last_frame: "crop:1.10" });
     assert(gt.ok && gt.derived === true, `pasangan turunan: G2 ditunda (${JSON.stringify(gt)})`);
     const gp = gate(fd, { type: "video", tier: "final", shot: "S02", first_frame: "/a.png", last_frame: "crop:1.10" });
