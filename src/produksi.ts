@@ -2,7 +2,7 @@
 // Self-check: `node dist/produksi.js --cek`
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { z } from "zod";
 import { techniqueById } from "./techniques.js";
 
@@ -10,12 +10,12 @@ export const SCALES = ["EWS", "WS", "FS", "MS", "MCU", "CU", "ECU"] as const;
 export const JOIN_TYPES = ["cut", "cut-on-action", "match-cut", "invisible", "push-through", "rack-focus", "whip", "dissolve", "dip"] as const;
 export const STAGES = ["mulai", "konsep", "kunci", "naskah", "shotlist", "keyframe", "uji", "generate", "qa", "suara", "rakit", "serah"] as const;
 
-const Beat = z.object({
+const Beat = z.strictObject({
   at: z.tuple([z.number(), z.number()]),
   action: z.string(),
   says: z.string().nullish(),
 });
-const Cast = z.object({
+const Cast = z.strictObject({
   identity: z.string(),
   voice: z.string().optional(),
   real_person: z.boolean().default(false),
@@ -25,17 +25,17 @@ const Cast = z.object({
   voice_ref: z.string().nullish(),
   wardrobe: z.record(z.string(), z.string()).default({}),
 });
-const Prop = z.object({
+const Prop = z.strictObject({
   description: z.string(),
   refs: z.array(z.string()).default([]),
   invariant: z.string().optional(),
 });
-const World = z.object({
+const World = z.strictObject({
   location: z.string(),
   light: z.string(),
   ambience: z.string().optional(),
 });
-const Shot = z.object({
+const Shot = z.strictObject({
   id: z.string(),
   world: z.string(),
   cast: z.array(z.string()).default([]),
@@ -46,16 +46,16 @@ const Shot = z.object({
   expression: z.string().optional(),
   screen_dir: z.enum(["L>R", "R>L"]).optional(),
   beats: z.array(Beat).default([]),
-  sfx: z.array(z.object({ at: z.number(), sound: z.string() })).default([]),
+  sfx: z.array(z.strictObject({ at: z.number(), sound: z.string() })).default([]),
   start: z.string().nullish(),
   end: z.string().nullish(),
-  join: z.object({ type: z.enum(JOIN_TYPES), at_prev: z.number().optional(), audio: z.enum(["j", "l"]).optional() }).optional(),
-  tier: z.string().default("final"),
+  join: z.strictObject({ type: z.enum(JOIN_TYPES), at_prev: z.number().optional(), audio: z.enum(["j", "l"]).optional() }).optional(),
+  tier: z.enum(["draft", "final", "hero"]).default("final"),
   chosen: z.string().nullish(),
   range: z.unknown().optional(),
 });
 
-export const ProductionSchema = z.object({
+export const ProductionSchema = z.strictObject({
   version: z.literal(1),
   title: z.string(),
   aspect_ratio: z.string(),
@@ -68,7 +68,7 @@ export const ProductionSchema = z.object({
   props: z.record(z.string(), Prop).default({}),
   worlds: z.record(z.string(), World).default({}),
   shots: z.array(Shot).default([]),
-  decisions: z.array(z.object({ date: z.string(), stage: z.string(), text: z.string() })).default([]),
+  decisions: z.array(z.strictObject({ date: z.string(), stage: z.string(), text: z.string() })).default([]),
 });
 export type Production = z.infer<typeof ProductionSchema>;
 export type Issue = { level: "error" | "warning"; shot?: string; code: string; message: string };
@@ -95,14 +95,19 @@ const outputRoot = () => process.env.FLOW_MCP_OUTPUT ?? join(homedir(), "flow-mc
 const privateRoot = () => process.env.SINEMA_PRIVATE_ROOT ?? dirname(resolve(outputRoot()));
 
 export function resolvePrivate(projectDir: string, ref: string): string {
-  if (ref.startsWith("privat:")) return join(privateRoot(), "talent-privat", basename(resolve(projectDir)), ref.slice(7));
+  if (ref.startsWith("privat:")) {
+    const base = join(privateRoot(), "talent-privat", basename(resolve(projectDir)));
+    const full = resolve(base, ref.slice(7));
+    if (full !== base && !full.startsWith(base + sep)) throw new Error(`privat: jalur keluar dari folder privat: ${ref}`);
+    return full;
+  }
   return resolve(projectDir, ref);
 }
 
 const wordCount = (s: string) => s.replace(/[^\p{L}\p{N}\s'-]+/gu, " ").split(/\s+/).filter(Boolean).length;
 const hasRef = (v: string | null | undefined) => !!v && v.trim() !== "";
 
-export function lint(p: Production, exists: (path: string) => boolean, projectDir = "."): Issue[] {
+export function lint(p: Production, exists: (path: string) => boolean, projectDir: string): Issue[] {
   const out: Issue[] = [];
   const add = (level: Issue["level"], code: string, message: string, shot?: string) => out.push({ level, code, message, ...(shot ? { shot } : {}) });
   const err = (code: string, message: string, shot?: string) => add("error", code, message, shot);
@@ -110,14 +115,19 @@ export function lint(p: Production, exists: (path: string) => boolean, projectDi
 
   for (const [name, c] of Object.entries(p.cast)) {
     if (!c.real_person) continue;
-    if (!hasRef(c.consent) || !exists(resolvePrivate(projectDir, c.consent!))) err("E_CONSENT", `pemeran '${name}' real_person tanpa berkas consent yang ada`);
+    let consentOk = false;
+    try { consentOk = hasRef(c.consent) && exists(resolvePrivate(projectDir, c.consent!)); } catch { /* jalur keluar folder privat */ }
+    if (!consentOk) err("E_CONSENT", `pemeran '${name}' real_person tanpa berkas consent yang ada`);
     for (const ph of c.photos ?? []) if (!ph.startsWith("privat:")) err("E_PHOTOS_PUBLIC", `pemeran '${name}': foto asli '${ph}' harus berawalan privat:`);
   }
   for (const [name, w] of Object.entries(p.worlds)) if (!hasRef(w.ambience)) warn("W_NO_AMBIENCE", `dunia '${name}' tanpa ambience`);
 
   let prev: Production["shots"][number] | undefined;
+  const seen = new Set<string>();
   for (const s of p.shots) {
     const id = s.id;
+    if (seen.has(id)) err("E_ID", `id shot '${id}' ganda`, id);
+    seen.add(id);
     if (!p.worlds[s.world]) err("E_ID", `world '${s.world}' tidak dikenal`, id);
     for (const c of s.cast) if (!p.cast[c]) err("E_ID", `pemeran '${c}' tidak dikenal`, id);
     for (const o of s.props) if (!p.props[o]) err("E_ID", `objek '${o}' tidak dikenal`, id);
@@ -166,7 +176,7 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
     return ProductionSchema.parse(d);
   };
   const yes = (_f: string) => true;
-  const codes = (p: Production, ex = yes) => lint(p, ex, "/tmp/x");
+  const codes = (p: Production, ex: (f: string) => boolean = yes) => lint(p, ex, "/tmp/x");
   const has = (is: Issue[], code: string, shot?: string) => is.some((i) => i.code === code && (!shot || i.shot === shot));
 
   const base = codes(mk());
@@ -196,6 +206,16 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   assert(has(codes(mk((d) => { d.shots[0].angle = "dutch-angle"; d.shots[0].move = "dolly-in"; })), "W_DUTCH_MOVE", "S01"), "W_DUTCH_MOVE");
   assert(has(codes(mk((d) => { d.shots[0].screen_dir = "L>R"; d.shots[1].screen_dir = "R>L"; })), "W_SCREEN_DIR", "S02"), "W_SCREEN_DIR");
   assert(has(codes(mk((d) => d.shots.forEach((s: any) => (s.angle = "eye-level")))), "W_FEW_ANGLES"), "W_FEW_ANGLES");
+  assert(has(codes(mk((d) => { d.cast.raka.real_person = true; d.cast.raka.consent = "privat:IZIN.md"; }), () => false), "E_CONSENT"), "consent diisi tapi berkas tak ada");
+  assert(has(codes(mk((d) => { d.cast.raka.real_person = true; d.cast.raka.consent = "privat:../../x"; })), "E_CONSENT"), "consent keluar folder privat");
+  let thrown = false;
+  try { resolvePrivate("/tmp/x", "privat:../../x"); } catch { thrown = true; }
+  assert(thrown, "resolvePrivate menolak ../");
+  assert(resolvePrivate("/tmp/x", "privat:a/b.jpg").endsWith("talent-privat/x/a/b.jpg"), "resolvePrivate normal");
+  assert(has(codes(mk((d) => (d.shots[1].id = "S01"))), "E_ID", "S01"), "id shot ganda");
+  assert(!ProductionSchema.safeParse({ ...raw, shots: [{ ...raw.shots[0], angel: "x" }] }).success, "kunci salah ketik ditolak (strict)");
+  assert(!ProductionSchema.safeParse({ ...raw, titel: "x" }).success, "kunci akar salah ketik ditolak");
+  assert(!ProductionSchema.safeParse({ ...raw, shots: [{ ...raw.shots[0], tier: "finel" }] }).success, "tier salah ketik ditolak");
   const { mkdtempSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const dir = mkdtempSync(join(tmpdir(), "produksi-cek-"));
