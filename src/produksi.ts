@@ -236,6 +236,59 @@ export function latestClip(projectDir: string, shot: string): string | undefined
   return l.length ? l[l.length - 1].file : undefined;
 }
 
+const cell = (v: unknown) => String(v ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
+
+/** Laporan gratis untuk flow_production check. Tidak membuka Flow; produksi.json rusak -> { error } (tak melempar). */
+export function checkReport(projectDir: string, format: "json" | "md" = "json"): object {
+  let p: Production | undefined;
+  let qa: Qa;
+  try {
+    p = loadProduction(projectDir);
+    qa = readQa(projectDir);
+  } catch (e) {
+    return { error: (e as Error).message };
+  }
+  if (!p) return { pipeline: false };
+  if (format === "md") {
+    const rows = p.shots.map((s) => {
+      const dlg = s.beats.map((b) => b.says).filter(Boolean).join(" / ");
+      return `| ${cell(s.id)} | ${cell(s.world)} | ${cell(`${s.angle} / ${s.scale} / ${s.move ?? "-"}`)} | ${cell(s.expression ?? "-")} | ${cell(dlg || "-")} | ${cell(s.join?.type ?? "-")} |`;
+    });
+    const md = [
+      `# ${p.title}`,
+      "",
+      "> Dibangkitkan dari produksi.json — jangan disunting",
+      "",
+      "| id | dunia | angle/skala/gerak | ekspresi | dialog | sambungan |",
+      "|---|---|---|---|---|---|",
+      ...rows,
+      "",
+    ].join("\n");
+    return { md };
+  }
+  const issues = lint(p, (f) => existsSync(f), projectDir);
+  const spent = spentCredits(projectDir);
+  const approved = p.budget_credits ?? null;
+  const missing: string[] = [];
+  if (approved === null) missing.push("budget_credits belum diisi");
+  const shots = p.shots.map((s) => {
+    const q = qa[s.id];
+    const passed = q?.keyframes?.passed === true;
+    const clips = Object.keys(q?.clips ?? {});
+    if (!passed) missing.push(`${s.id}: keyframe belum lulus`);
+    if (!s.chosen) missing.push(`${s.id}: klip belum dipilih`);
+    return { id: s.id, keyframes_passed: passed, clips, chosen: s.chosen ?? null };
+  });
+  return {
+    stage: p.stage,
+    errors: issues.filter((i) => i.level === "error"),
+    warnings: issues.filter((i) => i.level === "warning"),
+    budget: { approved, spent, remaining: approved === null ? null : approved - spent },
+    shots,
+    missing,
+  };
+}
+
 if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) {
   const assert = (c: unknown, m: string) => {
     if (!c) throw new Error(`cek gagal: ${m}`);
@@ -333,5 +386,25 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   assert(spentCredits(ld) === 24 + 10 + 5, "kredit unik per job; gagal (tanpa file) tak dihitung");
   assert(latestClip(ld, "S01") === "b1.mp4", "latestClip melewati entri tanpa file");
   assert(latestClip(ld, "S03") === undefined, "latestClip shot tanpa klip");
+  // checkReport (flow_production check)
+  const cd = mkd2(join(tmpdir(), "produksi-rep-"));
+  assert((checkReport(cd, "json") as any).pipeline === false, "tanpa produksi.json -> pipeline:false");
+  writeFileSync(join(cd, "produksi.json"), JSON.stringify(raw));
+  appendLog(cd, { t: "1", job: "j1", shot: "S01", file: "s1.mp4", credits: 24 });
+  mergeQa(cd, "S01", { keyframes: { passed: true, by: "t", at: "x" }, clips: { "s1.mp4": {} } });
+  const rep = checkReport(cd, "json") as any;
+  assert(rep.budget.approved === 48 && rep.budget.spent === 24 && rep.budget.remaining === 48 - 24, "budget.remaining = 48 - spent");
+  assert(rep.stage === "shotlist" && Array.isArray(rep.errors) && Array.isArray(rep.warnings), "bentuk laporan");
+  const r1 = rep.shots.find((x: any) => x.id === "S01");
+  assert(r1.keyframes_passed === true && r1.clips.includes("s1.mp4"), "shot S01 keyframe lulus + klip");
+  assert(rep.missing.includes("S02: keyframe belum lulus"), "missing: keyframe S02");
+  assert(!rep.missing.includes("S01: keyframe belum lulus"), "S01 tidak missing");
+  const md = (checkReport(cd, "md") as any).md as string;
+  assert(md.includes("Dibangkitkan dari produksi.json") && md.includes("jangan disunting") && md.includes("S01") && md.includes("cut-on-action"), "md memuat S01 dan cut-on-action");
+  writeFileSync(join(cd, "produksi.json"), JSON.stringify({ ...raw, budget_credits: undefined }));
+  assert((checkReport(cd, "json") as any).missing.includes("budget_credits belum diisi"), "missing: budget");
+  writeFileSync(join(cd, "produksi.json"), "{ rusak");
+  const bad2 = checkReport(cd, "json") as any;
+  assert(typeof bad2.error === "string" && bad2.error.includes("produksi.json") && bad2.error.includes(cd), "rusak -> error menyebut berkas");
   console.log("produksi ok");
 }

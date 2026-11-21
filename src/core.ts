@@ -8,6 +8,7 @@ import { KOKORO_DEFAULT_VOICE, KOKORO_MB, KOKORO_VOICES, kokoroReady, speakWithK
 import { extractFirstFrame, extractFrameAt, extractLastFrame } from "./chain.js";
 import { burnCaptions, captionedName, captionSetup, previewCaptions, transcribe } from "./captions.js";
 import { presenter } from "./presenter.js";
+import { checkReport } from "./produksi.js";
 import { characterLook, createCharacter, createProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
 import { JobQueue, type Job } from "./queue.js";
 import { earlierImages, imageKey, rememberImages } from "./dedup.js";
@@ -150,6 +151,11 @@ export const shapes = {
     project: z.string().min(1).describe("Local folder name under the output root."),
     assets: z.array(z.string().min(1)).min(1).max(30).describe("Titles (or title prefixes) from flow_assets, in the order they should be numbered."),
     quality: z.enum(["original", "upscaled"]).default("original"),
+  },
+  production: {
+    project: z.string().min(1).describe("Same project name used in flow_generate."),
+    action: z.enum(["check"]).describe("check: free report on the project's produksi.json (lint, budget, per-shot QA, what the next stage still lacks)."),
+    format: z.enum(["json", "md"]).default("json").describe("md returns a storyboard summary table generated from produksi.json."),
   },
   assemble: {
     project: z.string().min(1).describe("Same project name used in flow_generate."),
@@ -450,6 +456,7 @@ export interface Core {
   assets(a: Args<"assets">): Promise<unknown>;
   download(a: Args<"download">): Promise<unknown>;
   assemble(a: Args<"assemble">): Promise<unknown>;
+  production(a: Args<"production">): Promise<unknown>;
   techniques(a: Args<"techniques">): Promise<unknown>;
   voices(): Promise<unknown>;
   narrate(a: Args<"narrate">): Promise<unknown>;
@@ -707,6 +714,7 @@ export class LocalCore implements Core {
   caption_preview = captionPreviewHere;
   captions = captionsHere;
   presenter = presenterHere;
+  production = productionHere;
   caption_setup = captionSetupHere;
 
   // Everything already downloaded, newest project first, so the panel can show past work after a restart.
@@ -908,6 +916,11 @@ export async function transcribeHere({ video, language, words }: Args<"transcrib
     model: t.model,
     ...(words ? { words: t.words.map((w) => ({ text: w.text, start: Number(w.start.toFixed(2)), end: Number(w.end.toFixed(2)) })) } : {}),
   };
+}
+
+// Read-only and local: never touches Flow or its queue, so it runs in whichever process gets the call.
+export async function productionHere({ project, format }: Args<"production">) {
+  return checkReport(projectDir(project), format);
 }
 
 export async function presenterHere({ project, ...a }: Args<"presenter">) {

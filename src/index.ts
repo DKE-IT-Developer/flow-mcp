@@ -307,6 +307,18 @@ server.registerTool(
 );
 
 server.registerTool(
+  "flow_production",
+  {
+    title: "Check a production project",
+    description:
+      "Free and local: never opens Flow and spends no credits. Reads the project's produksi.json (the production plan) and reports its stage, lint errors and warnings, budget (approved, spent, remaining), per-shot keyframe QA and clips, and `missing`, short Indonesian notes on what the next step still lacks. `format: \"md\"` returns a storyboard table generated from produksi.json. A project without produksi.json returns { pipeline: false }; a broken file returns an error naming it.",
+    inputSchema: shapes.production,
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  (args) => reply(core.production(args)),
+);
+
+server.registerTool(
   "flow_transcribe",
   {
     title: "Hear the words in a video or audio file",
