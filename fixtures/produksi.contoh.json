@@ -1,0 +1,166 @@
+{
+  "version": 1,
+  "title": "Contoh — Kopi pagi",
+  "aspect_ratio": "9:16",
+  "stage": "shotlist",
+  "budget_credits": 48,
+  "dialogue_max_words": 5,
+  "music": false,
+  "camera": "Shot on a full-frame mirrorless camera, 35mm lens, natural film grain, real-time 24 fps.",
+  "cast": {
+    "raka": {
+      "identity": "Indonesian man, about 30, short wavy black hair, light stubble, warm brown eyes",
+      "voice": "relaxed mid-low male voice, casual Jakarta accent, unhurried",
+      "real_person": false,
+      "consent": null,
+      "face_refs": {
+        "neutral": "talent/raka-netral.png",
+        "curious": "talent/ekspresi/curiga.png",
+        "smile": "talent/ekspresi/senyum.png"
+      },
+      "voice_ref": null,
+      "wardrobe": {
+        "kafe": "rust-orange knit polo shirt, dark denim apron"
+      }
+    }
+  },
+  "props": {
+    "cangkir": {
+      "description": "white ceramic cup with a thin blue rim, 8 cm tall",
+      "refs": [
+        "objek/cangkir.png"
+      ],
+      "invariant": "the cup keeps its exact shape and blue rim; the handle stays on the right"
+    }
+  },
+  "worlds": {
+    "kafe": {
+      "location": "small Jakarta corner cafe, teak counter, white tiled wall",
+      "light": "Lighting constant: soft morning window light from frame left, warm 4500K, gentle fill from the white wall.",
+      "ambience": "quiet cafe room tone, distant street traffic, an espresso machine hissing far away"
+    }
+  },
+  "shots": [
+    {
+      "id": "S01",
+      "world": "kafe",
+      "cast": [
+        "raka"
+      ],
+      "props": [
+        "cangkir"
+      ],
+      "angle": "medium-shot",
+      "move": "dolly-in",
+      "scale": "MS",
+      "expression": "curious",
+      "beats": [
+        {
+          "at": [
+            0.0,
+            1.5
+          ],
+          "action": "he looks down at the cup, eyebrows rising slightly"
+        },
+        {
+          "at": [
+            1.5,
+            3.0
+          ],
+          "action": "he looks up into the lens",
+          "says": "Kopi apa ini?"
+        },
+        {
+          "at": [
+            3.0,
+            8.0
+          ],
+          "action": "he holds still while a small smile builds from the eyes"
+        }
+      ],
+      "sfx": [
+        {
+          "at": 0.8,
+          "sound": "cup set down softly on wood"
+        }
+      ],
+      "start": "ide/S01-awal.png",
+      "end": "ide/S01-akhir.png",
+      "join": {
+        "type": "cut"
+      },
+      "tier": "final",
+      "chosen": null,
+      "range": null
+    },
+    {
+      "id": "S02",
+      "world": "kafe",
+      "cast": [
+        "raka"
+      ],
+      "props": [
+        "cangkir"
+      ],
+      "angle": "close-up",
+      "move": null,
+      "scale": "CU",
+      "expression": "smile",
+      "beats": [
+        {
+          "at": [
+            0.0,
+            2.5
+          ],
+          "action": "he lifts the cup to his lips and sips, eyes closing briefly",
+          "says": null
+        }
+      ],
+      "start": "shot:S01@4.2",
+      "end": "crop:1.10",
+      "join": {
+        "type": "cut-on-action",
+        "at_prev": 4.2,
+        "audio": "l"
+      },
+      "tier": "final"
+    },
+    {
+      "id": "S03",
+      "world": "kafe",
+      "cast": [
+        "raka"
+      ],
+      "props": [
+        "cangkir"
+      ],
+      "angle": "wide-shot",
+      "move": "static",
+      "scale": "WS",
+      "expression": "neutral",
+      "beats": [
+        {
+          "at": [
+            0.0,
+            4.0
+          ],
+          "action": "he sets the cup on the counter and looks out of the window",
+          "says": null
+        }
+      ],
+      "start": "ide/S03-awal.png",
+      "end": "ide/S03-akhir.png",
+      "join": {
+        "type": "cut"
+      },
+      "tier": "final"
+    }
+  ],
+  "decisions": [
+    {
+      "date": "2026-11-21",
+      "stage": "konsep",
+      "text": "opsi 1 dipilih: satu orang, satu kafe, dua shot"
+    }
+  ]
+}
