@@ -1,4 +1,5 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -531,7 +532,7 @@ const BUSY = "A generation is running in the Flow tab. Wait for it to finish (fl
 // them with what generate() queued before production mode existed.
 export function buildParams(
   { chain_previous, reference_previous, technique, angle, outfit, on_screen_text, regenerate: _regenerate, tier, performance, shot, force, ...scene }: Scene,
-  ctx: { prevId?: string; output_dir: string; file_stem: string },
+  ctx: { prevId?: string; output_dir: string; file_stem: string; production?: boolean },
 ): { params: SceneParams; key?: string } {
   if (scene.type === "video" && tier && !scene.model) {
     scene.model = TIERS[tier];
@@ -572,9 +573,9 @@ export function buildParams(
     reference_from: reference_previous ? ctx.prevId : undefined,
     output_dir: ctx.output_dir,
     file_stem: ctx.file_stem,
-    // Production mode only: carried to the job (G3 at the quote, credit log). Absent keys keep params as before.
-    ...(shot ? { shot } : {}),
-    ...(force ? { force } : {}),
+    // Production mode only: carried to the job (credit log). Elsewhere they are dropped, so params stay as before.
+    ...(ctx.production && shot ? { shot } : {}),
+    ...(ctx.production && force ? { force } : {}),
   };
   // Local patch: the same image request again returns the earlier image instead of another tile in Flow. Scenes
   // that reference the previous scene depend on it, so they are always generated.
@@ -585,14 +586,14 @@ export function buildParams(
 // ---- Production mode (produksi.json) helpers: inert for projects without that file. ----
 
 // Seconds of a clip this project downloaded itself: Flow tiles are renamed "<project>-<stem>", the file is <stem>.mp4.
-function localClipSeconds(output_dir: string, asset: string): number | undefined {
+async function localClipSeconds(output_dir: string, asset: string): Promise<number | undefined> {
   const prefix = `${basename(output_dir)}-`;
   const stem = asset.startsWith(prefix) ? asset.slice(prefix.length) : asset;
   const file = join(output_dir, `${stem}.mp4`);
   if (!/^[\w.-]+$/.test(stem) || !existsSync(file)) return undefined;
   try {
-    const out = execFileSync(process.env.FLOW_MCP_FFPROBE ?? "ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file], { timeout: 10_000 });
-    const s = Number(String(out).trim());
+    const { stdout } = await execFileP(process.env.FLOW_MCP_FFPROBE ?? "ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file], { timeout: 10_000 });
+    const s = Number(String(stdout).trim());
     return Number.isFinite(s) && s > 0 ? s : undefined;
   } catch {
     return undefined;
@@ -601,13 +602,15 @@ function localClipSeconds(output_dir: string, asset: string): number | undefined
 
 // Paid tools with no Flow quote (edit, continue/Extend): a conservative estimate checked against the budget before the
 // job is queued. Returns the extra job params ({} outside production mode, so those params stay as they were).
-function estimateUnquoted(output_dir: string, kind: "edit" | "continue", asset?: string): { estimate?: number } {
+async function estimateUnquoted(output_dir: string, kind: "edit" | "continue", asset?: string): Promise<{ estimate?: number }> {
   const left = budgetLeft(output_dir);
   if (left === undefined) return {};
-  const estimate = estimateCost(kind, kind === "edit" && asset ? localClipSeconds(output_dir, asset) : undefined);
+  const estimate = estimateCost(kind, kind === "edit" && asset ? await localClipSeconds(output_dir, asset) : undefined);
   if (overBudget(left, estimate)) throw new Error(budgetMessage(left, estimate, "perkiraan"));
   return { estimate };
 }
+
+const execFileP = promisify(execFile);
 
 // After a job is done: one credit-log line per downloaded video (spentCredits counts each job id once). A failure to
 // log must not fail a job whose credits are already spent, so it only adds a note.
@@ -620,15 +623,18 @@ export function logDone(job: Job, files: string[]): string[] {
     for (const file of files.filter((f) => /\.(mp4|webm|mov)$/i.test(f))) {
       appendLog(s.output_dir, {
         t, job: job.id, shot: s.shot, file: basename(file),
+        // No-quote tools are charged their pre-run estimate, never the balance difference: the account is shared, so
+        // that difference can be far off either way (seen: -500, +1380). It is kept in `measured`, for information.
         quote: est ? s.estimate : job.credits,
-        credits: job.credits ?? s.estimate,
+        credits: est ? Math.max(s.estimate!, 0) : job.credits,
         ...(est ? { estimate: true } : {}),
+        ...(est && job.credits !== undefined ? { measured: job.credits } : {}),
         ...(s.force ? { force: s.force } : {}),
       });
     }
     if (est) {
-      const real = job.credits !== undefined ? `${job.credits} kredit, ${MEASURED_NOTE}` : "saldo tak terbaca, perkiraan yang dicatat";
-      job.note = [job.note, `perkiraan ${s.estimate} kredit; ${real}`].filter(Boolean).join(" · ");
+      const real = job.credits !== undefined ? `selisih saldo ${job.credits} kredit (${MEASURED_NOTE})` : "saldo tak terbaca";
+      job.note = [job.note, `anggaran dibebani perkiraan ${s.estimate} kredit; ${real}`].filter(Boolean).join(" · ");
     }
   } catch (e) {
     job.note = [job.note, `log produksi gagal ditulis: ${(e as Error).message}`].filter(Boolean).join(" · ");
@@ -695,6 +701,7 @@ export class LocalCore implements Core {
     const gates = scenes.map((s) => gate(output_dir, s));
     const refused = gates.flatMap((g, i) => (g.ok ? [] : [`Scene ${i + 1}: ${g.reason}`]));
     if (refused.length) throw new Error(refused.join("\n"));
+    const production = existsSync(join(output_dir, "produksi.json"));
     // Continue numbering after whatever is already on disk or queued, so reruns never overwrite earlier scenes.
     const onDisk = existsSync(output_dir) ? readdirSync(output_dir).map((f) => Number(f.match(/^scene-(\d+)/)?.[1] ?? 0)) : [];
     const queued = this.queue.list().filter((j) => j.params.output_dir === output_dir).map((j) => Number(j.params.file_stem.match(/\d+/)?.[0] ?? 0));
@@ -702,7 +709,7 @@ export class LocalCore implements Core {
     const jobs: Job[] = [];
     let reused = 0;
     for (const [i, scene] of scenes.entries()) {
-      const { params, key } = buildParams(scene, { prevId: jobs[i - 1]?.id, output_dir, file_stem: `scene-${String(offset + i + 1 - reused).padStart(2, "0")}` });
+      const { params, key } = buildParams(scene, { prevId: jobs[i - 1]?.id, output_dir, file_stem: `scene-${String(offset + i + 1 - reused).padStart(2, "0")}`, production });
       const earlier = key && !scene.regenerate ? earlierImages(key) : undefined;
       if (earlier) {
         reused++;
@@ -843,6 +850,8 @@ export class LocalCore implements Core {
 
   async agent({ project, scenes, aspect_ratio, download_quality, references, scene_references }: Args<"agent">) {
     const output_dir = projectDir(project);
+    // Agent mode shows no price, so in production mode it cannot be held to the budget: plain image scenes can.
+    if (existsSync(join(output_dir, "produksi.json"))) throw new Error("Mode produksi: pakai flow_generate type image (gratis, 0 kredit); mode agen tidak menampilkan harga.");
     if (scene_references && scene_references.length !== scenes.length) {
       throw new Error(`scene_references has ${scene_references.length} entries for ${scenes.length} scenes; give one list per scene (empty for none).`);
     }
@@ -869,7 +878,7 @@ export class LocalCore implements Core {
 
   async edit({ project, asset, prompt, download_quality }: Args<"edit">) {
     const output_dir = projectDir(project);
-    const estimate = estimateUnquoted(output_dir, "edit", asset);
+    const estimate = await estimateUnquoted(output_dir, "edit", asset);
     const job = this.queue.add({ prompt, type: "video", max_credits: 0, edit_asset: asset, download_quality, output_dir, file_stem: this.nextStem(output_dir, "edit"), ...estimate });
     return { output_dir, jobs: [jobView(job)] };
   }
@@ -894,7 +903,7 @@ export class LocalCore implements Core {
       }
     }
     const output_dir = projectDir(project);
-    const estimate = estimateUnquoted(output_dir, "continue");
+    const estimate = await estimateUnquoted(output_dir, "continue");
     const job = this.queue.add({
       prompt,
       type: "video",
@@ -1065,7 +1074,9 @@ if (process.argv[1]?.endsWith("core.js") && process.argv.includes("--cek")) {
   assert(got.length === golden.length, "jumlah scene");
   got.forEach((g, i) => assert(g === golden[i], `scene ${i + 1}: params berbeda dari sebelum perubahan\n  kini: ${g}\n  dulu: ${golden[i]}`));
   // shot/force hanya ikut bila diberikan; selebihnya params tetap sama.
-  const withShot = buildParams({ ...scenes[0], shot: "S01", force: "uji" }, { output_dir, file_stem: "scene-01" }).params;
+  const passed = buildParams({ ...scenes[0], shot: "S01", force: "uji" }, { output_dir, file_stem: "scene-01" });
+  assert(JSON.stringify({ ...passed.params, dedup_key: passed.key }) === golden[0], "di luar mode produksi shot/force tak masuk params (golden tetap)");
+  const withShot = buildParams({ ...scenes[0], shot: "S01", force: "uji" }, { output_dir, file_stem: "scene-01", production: true }).params;
   const { shot, force, ...rest } = withShot;
   assert(shot === "S01" && force === "uji", "shot/force dibawa ke job");
   assert(JSON.stringify(rest) === JSON.stringify(buildParams(scenes[0], { output_dir, file_stem: "scene-01" }).params), "selain shot/force identik");
@@ -1103,6 +1114,14 @@ if (process.argv[1]?.endsWith("core.js") && process.argv.includes("--cek")) {
     await gen(input.scenes);
     const cur = added.map((p) => JSON.stringify(p).split(JSON.stringify(dir).slice(1, -1)).join(output_dir));
     assert(cur.length === golden.length && cur.every((c, i) => c === golden[i]), "generate() tanpa produksi.json = params sebelum perubahan");
+    added = [];
+    n = 0; // job ids (chain_from) restart, as in the golden run
+    await gen(input.scenes.map((x: any) => ({ ...x, shot: "S01", force: "uji" })));
+    const cur2 = added.map((p) => JSON.stringify(p).split(JSON.stringify(dir).slice(1, -1)).join(output_dir));
+    assert(cur2.every((c, i) => c === golden[i]), "generate() tanpa produksi.json, shot/force diberikan -> params tetap golden");
+    added = [];
+    await core.agent({ project: "kopi-pagi", scenes: ["a"], aspect_ratio: "9:16" } as any);
+    assert(added.length === 1, "agent images tanpa produksi.json tetap jalan");
     // edit/continue without produksi.json: no estimate key
     added = [];
     await core.edit({ project: "kopi-pagi", asset: "x", prompt: "make it rain", acknowledge_cost: true } as any);
@@ -1138,13 +1157,26 @@ if (process.argv[1]?.endsWith("core.js") && process.argv.includes("--cek")) {
     assert(msg.includes("Anggaran project habis") && msg.includes("sisa 24") && msg.includes("perkiraan 50") && added.length === 0, `edit melebihi sisa -> ditolak sebelum antre (${msg})`);
     await core.continue_shot({ project: "kopi-pagi", from_asset: "kopi-pagi-scene-07", prompt: "he walks out", aspect_ratio: "9:16", mode: "exact", acknowledge_cost: true, force: true } as any);
     assert(added.length === 1 && added[0].estimate === 24, "continue = 24 <= sisa 24 -> diantre dengan estimate");
+    const contParams = added[0];
+    const added0 = () => contParams;
     const ej = { id: "je1", status: "done", params: added[0], files: [], attempts: 1, createdAt: "" } as Job;
     logDone(ej, [join(dir, "shot-01.mp4")]);
     assert(spentCredits(dir) === 48 && ej.note!.includes("saldo tak terbaca"), "saldo tak terbaca -> perkiraan dicatat");
     const mj = { id: "je2", status: "done", params: { ...added[0] }, files: [], attempts: 1, credits: 30, createdAt: "" } as Job;
     logDone(mj, [join(dir, "shot-02.mp4")]);
     const last = JSON.parse(rd(join(dir, "produksi-log.jsonl"), "utf8").trim().split("\n").pop()!);
-    assert(last.estimate === true && last.quote === 24 && last.credits === 30 && mj.note!.includes("terukur dari saldo"), "biaya nyata dari saldo dicatat berlabel");
+    assert(last.estimate === true && last.quote === 24 && last.credits === 24 && last.measured === 30 && mj.note!.includes("terukur dari saldo"), "anggaran = perkiraan; selisih saldo di measured, berlabel");
+    added = [];
+    msg = "";
+    try { await core.agent({ project: "kopi-pagi", scenes: ["a"], aspect_ratio: "9:16" } as any); } catch (e) { msg = (e as Error).message; }
+    assert(msg === "Mode produksi: pakai flow_generate type image (gratis, 0 kredit); mode agen tidak menampilkan harga." && added.length === 0, `agent images ditolak di mode produksi (${msg})`);
+    // estimate 20, measured -500 / +1380 -> budget charged 20 only
+    const before = spentCredits(dir);
+    const p20 = { ...added0(), estimate: 20 };
+    logDone({ id: "jm1", status: "done", params: p20, files: [], attempts: 1, credits: -500, createdAt: "" } as Job, [join(dir, "edit-01.mp4")]);
+    logDone({ id: "jm1", status: "done", params: p20, files: [], attempts: 1, credits: 1380, createdAt: "" } as Job, [join(dir, "edit-01.mp4")]);
+    const ml = rd(join(dir, "produksi-log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.job === "jm1");
+    assert(spentCredits(dir) - before === 20 && ml[0].measured === -500 && ml[1].measured === 1380 && ml.every((e) => e.credits === 20), "edit: anggaran = perkiraan 20, saldo di kolom measured");
     // 5. broken produksi.json: refused, file named, no job; another project is unaffected
     writeFileSync(join(dir, "produksi.json"), "{ rusak");
     added = [];

@@ -169,7 +169,7 @@ export type ClipQa = { motion?: string; face_median?: number; speech?: string; v
 export type Label = { kind: "voice" | "ambience"; verdict: "same" | "different" | "jump" | "ok"; file?: string; at: string };
 export type ShotQa = { keyframes?: { passed: boolean; face?: number; by: string; at: string }; clips?: Record<string, ClipQa>; labels?: Label[] };
 export type Qa = Record<string, ShotQa>;
-export type LogEntry = { t: string; job: string; shot?: string; file?: string; tier?: string; quote?: number; credits?: number; estimate?: boolean; force?: string };
+export type LogEntry = { t: string; job: string; shot?: string; file?: string; tier?: string; quote?: number; credits?: number; estimate?: boolean; force?: string; measured?: number };
 
 const QA_FILE = "qa.json";
 let tmpSeq = 0;
@@ -222,7 +222,7 @@ function readLog(projectDir: string): LogEntry[] {
   return out;
 }
 
-/** Kredit terpakai: hanya entri ber-file (job selesai), sekali per job id (retry tak menggandakan). */
+/** Kredit terpakai: hanya entri ber-file (job selesai), sekali per job id (retry tak menggandakan). `measured` (selisih saldo) diabaikan. */
 export function spentCredits(projectDir: string): number {
   const byJob = new Map<string, number>();
   for (const e of readLog(projectDir)) {
@@ -290,6 +290,21 @@ export function budgetLeft(projectDir: string): number | undefined {
   const p = loadProduction(projectDir);
   if (!p) return undefined;
   return (p.budget_credits ?? 0) - spentCredits(projectDir);
+}
+
+/**
+ * G3 di titik quote Flow (hanya video; draft = quote 0 lolos). Tanpa produksi.json -> ok. Tak bisa di-force.
+ * produksi.json rusak -> ditolak dengan jalur berkas.
+ */
+export function g3Check(projectDir: string, quote: number, scene: { type: string }): { ok: true } | { ok: false; reason: string } {
+  if (scene.type !== "video") return { ok: true };
+  let left: number | undefined;
+  try {
+    left = budgetLeft(projectDir);
+  } catch (e) {
+    return { ok: false, reason: (e as Error).message };
+  }
+  return left !== undefined && overBudget(left, quote) ? { ok: false, reason: budgetMessage(left, quote) } : { ok: true };
 }
 
 /** G3: quote 0 (draft) tak pernah ditolak. */
@@ -534,7 +549,7 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   // produksi.json rusak -> semua job project itu ditolak dengan pesan berkas + jalur
   writeFileSync(join(gd, "produksi.json"), "{ rusak");
   for (const sc of [{ ...fin, shot: "S03", force: "x" }, { type: "image" }, { type: "video", tier: "draft" }]) {
-    const r = why(gate(sc.type === "image" ? gd : gd, sc));
+    const r = why(gate(gd, sc));
     assert(r.includes("produksi.json") && r.includes(gd), `rusak -> ditolak menyebut berkas+jalur (${JSON.stringify(sc)})`);
   }
   writeFileSync(join(gd, "produksi.json"), JSON.stringify({ ...raw, stage: "ngawur" }));
@@ -543,6 +558,28 @@ if (process.argv[1]?.endsWith("produksi.js") && process.argv.includes("--cek")) 
   let threw = "";
   try { budgetLeft(gd); } catch (e) { threw = (e as Error).message; }
   assert(threw.includes(join(gd, "produksi.json")), "budgetLeft pada berkas rusak melempar dengan jalur");
+  // G3 sebagai fungsi murni (dipakai flow.ts di titik quote)
+  const g3d = mkd2(join(tmpdir(), "produksi-g3-"));
+  assert(g3Check(g3d, 999, { type: "video" }).ok === true, "G3 tanpa produksi.json -> ok");
+  writeFileSync(join(g3d, "produksi.json"), JSON.stringify(raw));
+  appendLog(g3d, { t: "1", job: "j1", file: "a.mp4", credits: 24 });
+  const g3 = g3Check(g3d, 30, { type: "video" });
+  assert(!g3.ok && g3.reason.includes("sisa 24") && g3.reason.includes("quote 30") && g3.reason.includes("budget_credits"), "G3 48-24 < 30 -> tolak");
+  assert(g3Check(g3d, 24, { type: "video" }).ok === true, "G3 quote = sisa -> ok");
+  assert(g3Check(g3d, 0, { type: "video" }).ok === true, "G3 quote 0 (draft) -> ok");
+  assert(g3Check(g3d, 30, { type: "image" }).ok === true, "G3 tidak berlaku untuk gambar");
+  writeFileSync(join(g3d, "produksi.json"), "{ rusak");
+  const g3b = g3Check(g3d, 1, { type: "video" });
+  assert(!g3b.ok && g3b.reason.includes(join(g3d, "produksi.json")), "G3 berkas rusak -> tolak menyebut jalur");
+  // alat tanpa quote: anggaran dibebani perkiraan; selisih saldo hanya informasi (measured)
+  const md2 = mkd2(join(tmpdir(), "produksi-measured-"));
+  appendLog(md2, { t: "1", job: "e1", file: "edit-01.mp4", quote: 20, credits: 20, estimate: true, measured: -500 });
+  appendLog(md2, { t: "2", job: "e2", file: "edit-02.mp4", quote: 20, credits: 20, estimate: true, measured: 1380 });
+  assert(spentCredits(md2) === 40, "measured (-500 / +1380) diabaikan; anggaran = perkiraan");
+  const md3 = mkd2(join(tmpdir(), "produksi-measured-"));
+  appendLog(md3, { t: "1", job: "e1", file: "edit-01.mp4", quote: 20, credits: 20, estimate: true, measured: -500 });
+  appendLog(md3, { t: "1", job: "e1", file: "edit-01.mp4", quote: 20, credits: 20, estimate: true, measured: 1380 });
+  assert(spentCredits(md3) === 20, "estimate 20, measured -500 dan +1380 -> spent 20");
   // alat tanpa quote
   assert(estimateCost("continue") === 24, "Extend/continue = harga klip Omni 1.2 (24)");
   assert(estimateCost("edit") === 50, "edit tanpa durasi diketahui = 5 x 10 dtk (terpanjang)");

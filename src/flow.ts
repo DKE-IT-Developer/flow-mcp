@@ -7,7 +7,7 @@ import type { Job } from "./queue.js";
 import { extractZip } from "./platform.js";
 import { forgetUpload, knownAssetNames, rememberUpload } from "./dedup.js";
 import { motionCheck } from "./motion.js";
-import { budgetLeft, budgetMessage, overBudget } from "./produksi.js";
+import { g3Check } from "./produksi.js";
 
 export interface FlowState {
   url: string;
@@ -879,10 +879,8 @@ export async function runGeneration(job: Job): Promise<string[]> {
   }
   // G3, production mode only (produksi.json in the project folder): credits already logged + this quote must fit
   // budget_credits. Not forceable; budgetLeft is undefined for every other project, so nothing changes there.
-  if (s.type === "video") {
-    const left = budgetLeft(s.output_dir);
-    if (left !== undefined && overBudget(left, job.credits)) throw new Error(`${budgetMessage(left, job.credits)} Nothing was generated.`);
-  }
+  const g3 = g3Check(s.output_dir, job.credits, s);
+  if (!g3.ok) throw new Error(`${g3.reason} Nothing was generated.`);
 
   if (s.first_frame) {
     await attachFile(page, page.getByRole("button", { name: "Start", exact: true }), job, s.first_frame, "start");
