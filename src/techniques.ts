@@ -1,6 +1,6 @@
 export interface Technique {
   id: string;
-  category: "camera" | "product" | "transition" | "image";
+  category: "angle" | "camera" | "product" | "transition" | "image";
   name: string;
   needs?: string;
   phrase: string;
@@ -8,6 +8,22 @@ export interface Technique {
 
 // Prompt fragments for common film moves. One per scene: two camera instructions fight each other.
 export const TECHNIQUES: Technique[] = [
+  // angle (DKE fork, 21 Nov 2026): framing named FIRST in the prompt via `angle` (weight at start), one per scene.
+  // Source: Threads @syafinaira_76 "20 angle kamera" (Omni 1.2 Flash). Mix 2-3 different angles across a video.
+  { id: "eye-level", category: "angle", name: "Eye level — natural", phrase: "Eye-level shot, the camera at the subject's eye height looking straight at them, natural and neutral." },
+  { id: "close-up", category: "angle", name: "Close-up — emotion lands", phrase: "Close-up shot, the face fills the frame from the chin to the top of the head." },
+  { id: "low-angle", category: "angle", name: "Low angle — confident", phrase: "Low angle shot, the camera below eye level near the floor looking up at the subject, who looks confident and strong." },
+  { id: "high-angle", category: "angle", name: "High angle — softer", phrase: "High angle shot, the camera above eye level looking down at the subject, who looks softer and gentler." },
+  { id: "birds-eye", category: "angle", name: "Bird's eye — straight overhead", phrase: "Bird's-eye shot, the camera directly above the subject's head looking straight down." },
+  { id: "worms-eye", category: "angle", name: "Worm's eye — grand", phrase: "Worm's-eye shot, the camera on the floor pointing steeply up at the subject, who towers grandly over the lens." },
+  { id: "over-the-shoulder", category: "angle", name: "Over the shoulder — conversation", phrase: "Over-the-shoulder shot, the camera behind the shoulder of a person in the soft-focus foreground, framing the subject facing them as if in conversation." },
+  { id: "extreme-close-up", category: "angle", name: "Extreme close-up — intense", phrase: "Extreme close-up, only the eyes fill the frame, intense." },
+  { id: "medium-shot", category: "angle", name: "Medium shot — safest", phrase: "Medium shot, framed from the waist up." },
+  { id: "full-body", category: "angle", name: "Full body — head to toe", phrase: "Full-body shot, the whole figure from head to toe with a little space above and below." },
+  { id: "wide-shot", category: "angle", name: "Wide — person and place", phrase: "Wide shot, the subject small within the room so both the person and the place read clearly." },
+  { id: "extreme-wide", category: "angle", name: "Extreme wide — lonely", phrase: "Extreme wide shot, the whole space visible and the subject tiny within it, a quiet, lonely mood." },
+  { id: "dutch-angle", category: "angle", name: "Dutch angle — uneasy (static tilt only)", phrase: "Dutch angle, the camera tilted about 15 degrees and held still, an uneasy, tense feel." },
+  { id: "pov", category: "angle", name: "POV — through someone's eyes", phrase: "POV shot, seen through the eyes of a person looking at the subject, with slight natural head movement." },
   // camera
   { id: "dolly-zoom", category: "camera", name: "Dolly zoom (vertigo)", phrase: "Dolly zoom: the camera tracks backward while zooming in, the subject stays the same size in frame while the background stretches away behind them." },
   { id: "snap-zoom-eyes", category: "camera", name: "Snap zoom to eyes", phrase: "Sudden snap zoom from a medium shot straight into an extreme close-up of the eyes, ending perfectly sharp." },
@@ -20,6 +36,11 @@ export const TECHNIQUES: Technique[] = [
   { id: "static", category: "camera", name: "Locked-off static", phrase: "Locked-off static camera on a tripod, no camera movement, no cuts, a single framing for the whole shot." },
   { id: "handheld", category: "camera", name: "Handheld documentary", phrase: "Handheld documentary camera with subtle natural shake and small reframing, observational feel." },
   { id: "lateral-track", category: "camera", name: "Lateral tracking", phrase: "The camera tracks sideways parallel to the subject at a steady pace, foreground elements sliding past for parallax." },
+  { id: "dolly-in", category: "camera", name: "Dolly in — suspense", phrase: "The camera dollies slowly straight toward the subject, building suspense." },
+  { id: "dolly-out", category: "camera", name: "Dolly out — closing", phrase: "The camera dollies slowly straight back away from the subject, like the end of a story." },
+  { id: "orbit-arc", category: "camera", name: "Orbit arc — cinematic", phrase: "The camera circles slowly about a quarter turn around the subject at constant height." },
+  { id: "tracking-walk", category: "camera", name: "Tracking — follows the walk", phrase: "Tracking shot, the camera moves alongside the subject as they walk, keeping them in frame." },
+  { id: "drone-reveal", category: "camera", name: "Drone reveal — whole place", phrase: "Drone shot, the camera flies up and away from the subject to reveal the whole building and its surroundings." },
   { id: "crane-up", category: "camera", name: "Crane up", phrase: "The camera cranes smoothly upward from eye level to a high angle, opening the scene from above." },
   { id: "top-down", category: "camera", name: "Top-down", phrase: "Strict top-down overhead shot, camera pointing straight down, perfectly perpendicular to the surface." },
   { id: "zoom-out-to-space", category: "camera", name: "Zoom out to space", phrase: "One continuous pull-back that starts on the subject and rises through the clouds until the whole Earth is visible from space." },

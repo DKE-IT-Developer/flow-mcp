@@ -24,6 +24,7 @@ export const PLAYBOOK = {
   prompt_rules: [
     "Write prompts in English, one continuous shot per scene, one camera move per scene.",
     "Name the camera behaviour explicitly (static locked-off, slow push-in, orbit, crane up, handheld).",
+    "Name the camera ANGLE first: pass `angle` (eye-level, close-up, low-angle, high-angle, birds-eye, worms-eye, over-the-shoulder, extreme-close-up, medium-shot, full-body, wide-shot, extreme-wide, dutch-angle, pov) so its phrase opens the prompt, plus at most one camera-move `technique` (dolly-in, dolly-out, orbit-arc, tracking-walk, crane-up, drone-reveal). Vary the angle from clip to clip (2-3 different angles per video at least) while keeping the same person, outfit, location and light: that variety is what makes AI video read as film. Each angle carries a feeling: low = confident, high = softer, extreme wide = lonely, close-up = emotion, dutch = unease.",
     "Repeat the full description of a recurring character or product in every scene; Flow has no memory between scenes.",
     "Put spoken lines in quotes and say who speaks; keep a line short enough for the clip length.",
     "Put every spoken line INSIDE the second-by-second timeline, at the moment it is said, and spell out its order against the actions ('0.0-1.2 s: she says \"Watch this.\" with her hands still; 1.2-2.5 s: only after saying it, she taps the lamp'). A separate DIALOGUE block lets the model choose the order, and it did: she tapped the lamp first, then said \"Watch this.\"",

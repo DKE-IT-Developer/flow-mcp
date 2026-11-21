@@ -54,6 +54,7 @@ const sceneSchema = z.object({
   download_quality: z.enum(["original", "upscaled"]).optional().describe("'upscaled' fetches 1080p video / 2K image (free, slower). Default original."),
   retries: z.number().int().min(0).max(3).default(1).describe("Automatic retries when Flow itself reports the generation failed."),
   technique: z.string().optional().describe("Id from flow_techniques (e.g. 'orbit-360'); its exact phrase is appended to the prompt. One per scene."),
+  angle: z.string().optional().describe("Camera angle id from flow_techniques category 'angle' (e.g. 'low-angle', 'over-the-shoulder'); its phrase OPENS the prompt, where the model weighs it most. One per scene; combine with a camera-move technique, and vary angles across scenes."),
   on_screen_text: z
     .boolean()
     .optional()
@@ -419,7 +420,7 @@ export const shapes = {
     personality: z.string().max(500).optional().describe("How the character acts; Flow uses it when crafting scenes."),
     voice: z.string().optional().describe("Flow voice name, e.g. 'Charon' (male, informative) or 'Aoede' (female, breezy)."),
   },
-  techniques: { category: z.enum(["camera", "product", "transition", "image"]).optional() },
+  techniques: { category: z.enum(["angle", "camera", "product", "transition", "image"]).optional() },
 };
 
 type Args<K extends keyof typeof shapes> = z.infer<z.ZodObject<(typeof shapes)[K]>>;
@@ -552,6 +553,8 @@ export class LocalCore implements Core {
     if (noPrev >= 0) throw new Error("Scene 1 has no previous scene to reference.");
     const unknown = scenes.find((s) => s.technique && !techniqueById(s.technique));
     if (unknown) throw new Error(`Unknown technique "${unknown.technique}". Call flow_techniques for valid ids.`);
+    const badAngle = scenes.find((s) => s.angle && techniqueById(s.angle)?.category !== "angle");
+    if (badAngle) throw new Error(`Unknown angle "${badAngle.angle}". Call flow_techniques with category "angle" for valid ids.`);
 
     const output_dir = projectDir(project);
     // Continue numbering after whatever is already on disk or queued, so reruns never overwrite earlier scenes.
@@ -560,7 +563,7 @@ export class LocalCore implements Core {
     const offset = Math.max(0, ...onDisk, ...queued);
     const jobs: Job[] = [];
     let reused = 0;
-    for (const [i, { chain_previous, reference_previous, technique, outfit, on_screen_text, regenerate, tier, performance, ...scene }] of scenes.entries()) {
+    for (const [i, { chain_previous, reference_previous, technique, angle, outfit, on_screen_text, regenerate, tier, performance, ...scene }] of scenes.entries()) {
       if (scene.type === "video" && tier && !scene.model) {
         scene.model = TIERS[tier];
         if (tier === "hero") scene.variants ??= 2; // two takes; quote ~48, so max_credits must be raised on purpose
@@ -568,6 +571,7 @@ export class LocalCore implements Core {
       }
       const acting = scene.type === "video" && performance !== false && PEOPLE.test(scene.prompt) ? ` ${PERFORMANCE}` : "";
       const phrase = technique ? techniqueById(technique)!.phrase : "";
+      const opening = angle ? `${techniqueById(angle)!.phrase} ` : "";
       // A referenced character must come out identical, not merely similar, so the scene says so explicitly. The
       // wording stays medium-neutral: the same lock has to serve a flat cartoon character and a photoreal avatar.
       const cast = (scene.reference_images ?? [])
@@ -594,7 +598,7 @@ export class LocalCore implements Core {
         : "";
       const params = {
         ...scene,
-        prompt: `${textFirst}${scene.prompt.trim().replace(/\.?$/, ".")}${phrase ? ` ${phrase}` : ""}${lock}${inherit}${acting}${textLast}`,
+        prompt: `${textFirst}${opening}${scene.prompt.trim().replace(/\.?$/, ".")}${phrase ? ` ${phrase}` : ""}${lock}${inherit}${acting}${textLast}`,
         chain_from: chain_previous ? jobs[i - 1].id : undefined,
         reference_from: reference_previous ? jobs[i - 1].id : undefined,
         output_dir,
